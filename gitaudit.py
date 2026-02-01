@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-"""
-gitaudit - Git Repository Hygiene Auditor
+"""gitaudit - Git Repository Health Checker
 
-A zero-dependency tool for auditing git repository health and hygiene.
-Uses only Python stdlib and git CLI commands.
+Audit a git repo for common issues: large files in history, potential secrets
+in commits, stale branches, missing .gitignore patterns, merge conflict
+markers, TODO/FIXME tracking, and more. Like a linter for your repo itself.
+
+Usage:
+    gitaudit                        Audit current repo
+    gitaudit /path/to/repo          Audit specific repo
+    gitaudit --check secrets        Only check for secrets
+    gitaudit --json                 JSON output
+    gitaudit --check size           Only check large files
+    gitaudit --verbose              Show all findings with details
+
+Author: github.com/kriskimmerle
+License: MIT
 """
+
+__version__ = "1.0.0"
 
 import argparse
 import json
@@ -12,889 +25,660 @@ import os
 import re
 import subprocess
 import sys
-from collections import defaultdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+import textwrap
+
+# ── ANSI colors ────────────────────────────────────────────────────────────
+
+class C:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+NO_COLOR = os.environ.get("NO_COLOR") is not None or not sys.stdout.isatty()
+if NO_COLOR:
+    for attr in ("RED", "GREEN", "YELLOW", "BLUE", "CYAN", "BOLD", "DIM", "RESET"):
+        setattr(C, attr, "")
 
 
-class Severity:
-    ERROR = "ERROR"
-    WARNING = "WARNING"
-    INFO = "INFO"
+# ── Git helpers ────────────────────────────────────────────────────────────
+
+def git(*args, cwd=None):
+    """Run a git command and return stdout."""
+    try:
+        result = subprocess.run(
+            ["git"] + list(args),
+            cwd=cwd, capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout.strip(), result.returncode
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return "", 1
 
 
-class Finding:
-    """Represents a single audit finding."""
-    
-    def __init__(self, check_id: str, severity: str, title: str, 
-                 description: str, details: Any = None):
-        self.check_id = check_id
-        self.severity = severity
-        self.title = title
-        self.description = description
-        self.details = details or {}
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "check_id": self.check_id,
-            "severity": self.severity,
-            "title": self.title,
-            "description": self.description,
-            "details": self.details
-        }
+def is_git_repo(path):
+    """Check if path is inside a git repo."""
+    _, code = git("rev-parse", "--git-dir", cwd=path)
+    return code == 0
 
 
-class GitAuditor:
-    """Main auditor class that runs all checks."""
-    
-    def __init__(self, repo_path: str, max_file_size_mb: int = 5, 
-                 stale_days: int = 90, ignored_checks: List[str] = None):
-        self.repo_path = Path(repo_path).resolve()
-        self.max_file_size_mb = max_file_size_mb
-        self.stale_days = stale_days
-        self.ignored_checks = ignored_checks or []
-        self.findings: List[Finding] = []
-        
-        if not self._is_git_repo():
-            raise ValueError(f"Not a git repository: {self.repo_path}")
-    
-    def _is_git_repo(self) -> bool:
-        """Check if path is a git repository."""
-        try:
-            self._run_git("rev-parse", "--git-dir")
-            return True
-        except subprocess.CalledProcessError:
-            return False
-    
-    def _run_git(self, *args, **kwargs) -> str:
-        """Run a git command and return stdout."""
-        cmd = ["git"] + list(args)
-        kwargs.setdefault("cwd", self.repo_path)
-        kwargs.setdefault("capture_output", True)
-        kwargs.setdefault("text", True)
-        kwargs.setdefault("check", True)
-        
-        result = subprocess.run(cmd, **kwargs)
-        return result.stdout.strip()
-    
-    def _get_git_dir(self) -> Path:
-        """Get the .git directory path."""
-        git_dir = self._run_git("rev-parse", "--git-dir")
-        return (self.repo_path / git_dir).resolve()
-    
-    def _get_dir_size(self, path: Path) -> int:
-        """Calculate directory size in bytes."""
-        total = 0
-        try:
-            for entry in path.rglob("*"):
-                if entry.is_file():
-                    total += entry.stat().st_size
-        except (OSError, PermissionError):
-            pass
-        return total
-    
-    def run_all_checks(self) -> None:
-        """Run all audit checks."""
-        checks = [
-            ("GA001", self.check_large_files),
-            ("GA002", self.check_repo_size),
-            ("GA003", self.check_stale_branches),
-            ("GA004", self.check_orphan_tags),
-            ("GA005", self.check_gitignore),
-            ("GA006", self.check_unsigned_commits),
-            ("GA007", self.check_commit_messages),
-            ("GA008", self.check_unmerged_branches),
-            ("GA009", self.check_missing_license),
-            ("GA010", self.check_sensitive_files),
-            ("GA011", self.check_shallow_clone),
-            ("GA012", self.check_submodule_health),
-        ]
-        
-        for check_id, check_func in checks:
-            if check_id not in self.ignored_checks:
-                try:
-                    check_func()
-                except Exception as e:
-                    # Log errors but continue with other checks
-                    print(f"Warning: Check {check_id} failed: {e}", file=sys.stderr)
-    
-    def check_large_files(self) -> None:
-        """GA001: Find large files in git history."""
-        threshold_bytes = self.max_file_size_mb * 1024 * 1024
-        
-        try:
-            # Get all objects with their sizes
-            objects = self._run_git("rev-list", "--objects", "--all")
-            if not objects:
-                return
-            
-            large_files = []
-            
-            # Process in batches for efficiency
-            object_lines = objects.split('\n')
-            for line in object_lines:
-                if not line.strip():
-                    continue
-                    
-                parts = line.split(None, 1)
-                sha = parts[0]
-                filename = parts[1] if len(parts) > 1 else ""
-                
-                if not filename:  # Skip commits and trees
-                    continue
-                
-                try:
-                    # Get object size
-                    info = self._run_git("cat-file", "-s", sha)
-                    size = int(info)
-                    
-                    if size > threshold_bytes:
-                        large_files.append({
-                            "file": filename,
-                            "size_mb": round(size / (1024 * 1024), 2),
-                            "sha": sha[:8]
-                        })
-                except (subprocess.CalledProcessError, ValueError):
-                    continue
-            
-            if large_files:
-                # Sort by size
-                large_files.sort(key=lambda x: x["size_mb"], reverse=True)
-                self.findings.append(Finding(
-                    "GA001",
-                    Severity.WARNING,
-                    "Large files in history",
-                    f"Found {len(large_files)} file(s) over {self.max_file_size_mb}MB in git history",
-                    {"files": large_files[:10]}  # Limit to top 10
-                ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def check_repo_size(self) -> None:
-        """GA002: Check total repository size."""
-        git_dir = self._get_git_dir()
-        size_bytes = self._get_dir_size(git_dir)
-        size_mb = size_bytes / (1024 * 1024)
-        
-        # Info threshold: 100MB
-        if size_mb > 100:
-            self.findings.append(Finding(
-                "GA002",
-                Severity.INFO,
-                "Large repository size",
-                f"Repository .git directory is {size_mb:.1f}MB",
-                {"size_mb": round(size_mb, 1)}
-            ))
-    
-    def check_stale_branches(self) -> None:
-        """GA003: Find stale remote-tracking branches."""
-        try:
-            branches = self._run_git("branch", "-r", "--format=%(refname:short)|%(committerdate:iso-strict)")
-            if not branches:
-                return
-            
-            now = datetime.now(timezone.utc)
-            stale_branches = []
-            
-            for line in branches.split('\n'):
-                if not line.strip() or "->" in line:  # Skip HEAD references
-                    continue
-                
-                parts = line.split('|')
-                if len(parts) != 2:
-                    continue
-                
-                branch_name, date_str = parts
-                try:
-                    commit_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    days_old = (now - commit_date).days
-                    
-                    if days_old > self.stale_days:
-                        stale_branches.append({
-                            "branch": branch_name,
-                            "days_old": days_old
-                        })
-                except (ValueError, AttributeError):
-                    continue
-            
-            if stale_branches:
-                stale_branches.sort(key=lambda x: x["days_old"], reverse=True)
-                self.findings.append(Finding(
-                    "GA003",
-                    Severity.WARNING,
-                    "Stale branches detected",
-                    f"Found {len(stale_branches)} branch(es) with no commits in {self.stale_days}+ days",
-                    {"branches": stale_branches[:10]}
-                ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def check_orphan_tags(self) -> None:
-        """GA004: Find tags pointing to unreachable commits."""
-        try:
-            # Get all tags
-            tags = self._run_git("tag")
-            if not tags:
-                return
-            
-            # Get all commits reachable from branches
-            reachable = self._run_git("rev-list", "--all")
-            reachable_commits = set(reachable.split('\n'))
-            
-            orphan_tags = []
-            for tag in tags.split('\n'):
-                if not tag.strip():
-                    continue
-                
-                try:
-                    # Get commit that tag points to
-                    commit = self._run_git("rev-list", "-n", "1", tag)
-                    if commit not in reachable_commits:
-                        orphan_tags.append(tag)
-                except subprocess.CalledProcessError:
-                    continue
-            
-            if orphan_tags:
-                self.findings.append(Finding(
-                    "GA004",
-                    Severity.INFO,
-                    "Orphan tags detected",
-                    f"Found {len(orphan_tags)} tag(s) pointing to unreachable commits",
-                    {"tags": orphan_tags}
-                ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def check_gitignore(self) -> None:
-        """GA005: Check for missing or incomplete .gitignore."""
-        gitignore_path = self.repo_path / ".gitignore"
-        
-        if not gitignore_path.exists():
-            self.findings.append(Finding(
-                "GA005",
-                Severity.WARNING,
-                "Missing .gitignore",
-                "No .gitignore file found in repository root",
-                {}
-            ))
-            return
-        
-        # Detect languages and check for common patterns
-        try:
-            files = self._run_git("ls-files")
-            extensions = defaultdict(int)
-            
-            for file in files.split('\n'):
-                if '.' in file:
-                    ext = file.rsplit('.', 1)[1].lower()
-                    extensions[ext] += 1
-            
-            # Read .gitignore
-            gitignore_content = gitignore_path.read_text().lower()
-            
-            missing_patterns = []
-            
-            # Python
-            if extensions.get('py', 0) > 0:
-                if '__pycache__' not in gitignore_content:
-                    missing_patterns.append('__pycache__/')
-                if '.pyc' not in gitignore_content:
-                    missing_patterns.append('*.pyc')
-                if '.egg-info' not in gitignore_content:
-                    missing_patterns.append('*.egg-info/')
-            
-            # Node.js
-            if extensions.get('js', 0) > 0 or (self.repo_path / "package.json").exists():
-                if 'node_modules' not in gitignore_content:
-                    missing_patterns.append('node_modules/')
-            
-            # Go
-            if extensions.get('go', 0) > 0:
-                if not any(p in gitignore_content for p in ['*.exe', '*.test']):
-                    missing_patterns.append('*.exe, *.test')
-            
-            # Rust
-            if (self.repo_path / "Cargo.toml").exists():
-                if 'target/' not in gitignore_content:
-                    missing_patterns.append('target/')
-            
-            if missing_patterns:
-                self.findings.append(Finding(
-                    "GA005",
-                    Severity.WARNING,
-                    "Incomplete .gitignore",
-                    f"Missing {len(missing_patterns)} common pattern(s) for detected languages",
-                    {"missing_patterns": missing_patterns}
-                ))
-        except (subprocess.CalledProcessError, OSError):
-            pass
-    
-    def check_unsigned_commits(self) -> None:
-        """GA006: Check for unsigned commits."""
-        try:
-            # Get all commits with signature info
-            log = self._run_git("log", "--format=%H|%G?", "--all")
-            if not log:
-                return
-            
-            total_commits = 0
-            unsigned_commits = 0
-            
-            for line in log.split('\n'):
-                if not line.strip():
-                    continue
-                
-                parts = line.split('|')
-                if len(parts) != 2:
-                    continue
-                
-                total_commits += 1
-                sig_status = parts[1]
-                
-                # G = good, B = bad, U = good but unknown validity, N = no signature
-                if sig_status in ['N', 'E']:  # No signature or error
-                    unsigned_commits += 1
-            
-            if total_commits > 0:
-                unsigned_pct = (unsigned_commits / total_commits) * 100
-                
-                if unsigned_pct > 50:
-                    self.findings.append(Finding(
-                        "GA006",
-                        Severity.INFO,
-                        "Many unsigned commits",
-                        f"{unsigned_pct:.1f}% of commits are unsigned ({unsigned_commits}/{total_commits})",
-                        {
-                            "unsigned_count": unsigned_commits,
-                            "total_count": total_commits,
-                            "unsigned_percentage": round(unsigned_pct, 1)
-                        }
-                    ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def check_commit_messages(self) -> None:
-        """GA007: Check for inconsistent commit messages."""
-        try:
-            # Get commit messages from main/master branch
-            default_branch = self._get_default_branch()
-            if not default_branch:
-                return
-            
-            messages = self._run_git("log", default_branch, "--format=%s", "-100")
-            if not messages:
-                return
-            
-            message_list = messages.split('\n')
-            total = len(message_list)
-            
-            short_messages = 0
-            wip_messages = 0
-            conventional = 0
-            
-            conventional_pattern = re.compile(r'^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?:.+')
-            
-            for msg in message_list:
-                if len(msg) < 10:
-                    short_messages += 1
-                
-                if re.match(r'^\s*(wip|WIP|fixup|squash)', msg, re.IGNORECASE):
-                    wip_messages += 1
-                
-                if conventional_pattern.match(msg):
-                    conventional += 1
-            
-            issues = []
-            
-            if short_messages > total * 0.2:
-                issues.append(f"{short_messages} very short messages (<10 chars)")
-            
-            if wip_messages > 0:
-                issues.append(f"{wip_messages} WIP/fixup commits")
-            
-            # Mixed style: some conventional, some not
-            if 0 < conventional < total * 0.8:
-                issues.append(f"Inconsistent commit style ({conventional}/{total} conventional)")
-            
-            if issues:
-                self.findings.append(Finding(
-                    "GA007",
-                    Severity.INFO,
-                    "Inconsistent commit messages",
-                    f"Found {len(issues)} commit message issue(s)",
-                    {"issues": issues}
-                ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def _get_default_branch(self) -> Optional[str]:
-        """Get the default branch name (main/master)."""
-        try:
-            # Try symbolic ref
-            branch = self._run_git("symbolic-ref", "refs/remotes/origin/HEAD")
-            return branch.replace('refs/remotes/origin/', '')
-        except subprocess.CalledProcessError:
-            # Fallback: check for main or master
+# ── Audit Checks ──────────────────────────────────────────────────────────
+
+def check_large_files(repo_path, threshold_kb=500):
+    """Find large files in the working tree."""
+    findings = []
+    for root, dirs, files in os.walk(repo_path):
+        # Skip .git directory
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for fname in files:
+            fpath = os.path.join(root, fname)
             try:
-                branches = self._run_git("branch", "--format=%(refname:short)")
-                for branch in branches.split('\n'):
-                    if branch in ['main', 'master']:
-                        return branch
-                # Return first branch
-                return branches.split('\n')[0] if branches else None
-            except subprocess.CalledProcessError:
-                return None
-    
-    def check_unmerged_branches(self) -> None:
-        """GA008: Find local branches that diverged from main."""
-        try:
-            default_branch = self._get_default_branch()
-            if not default_branch:
-                return
-            
-            # Get local branches
-            branches = self._run_git("branch", "--format=%(refname:short)")
-            if not branches:
-                return
-            
-            diverged = []
-            
-            for branch in branches.split('\n'):
-                if not branch or branch == default_branch:
-                    continue
-                
-                try:
-                    # Count commits not in default branch
-                    ahead = self._run_git("rev-list", "--count", f"{default_branch}..{branch}")
-                    behind = self._run_git("rev-list", "--count", f"{branch}..{default_branch}")
-                    
-                    ahead_count = int(ahead) if ahead else 0
-                    behind_count = int(behind) if behind else 0
-                    
-                    # Significantly diverged: more than 10 commits behind
-                    if behind_count > 10:
-                        diverged.append({
-                            "branch": branch,
-                            "ahead": ahead_count,
-                            "behind": behind_count
-                        })
-                except (subprocess.CalledProcessError, ValueError):
-                    continue
-            
-            if diverged:
-                self.findings.append(Finding(
-                    "GA008",
-                    Severity.INFO,
-                    "Diverged branches detected",
-                    f"Found {len(diverged)} branch(es) significantly behind {default_branch}",
-                    {"branches": diverged}
-                ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def check_missing_license(self) -> None:
-        """GA009: Check for missing LICENSE file."""
-        license_patterns = ["LICENSE", "COPYING", "LICENSE.md", "LICENSE.txt", "LICENCE"]
-        
-        for pattern in license_patterns:
-            if (self.repo_path / pattern).exists():
-                return
-            # Case-insensitive check
-            for file in self.repo_path.iterdir():
-                if file.name.upper() == pattern.upper():
-                    return
-        
-        self.findings.append(Finding(
-            "GA009",
-            Severity.WARNING,
-            "Missing LICENSE file",
-            "No LICENSE or COPYING file found in repository root",
-            {}
-        ))
-    
-    def check_sensitive_files(self) -> None:
-        """GA010: Check for sensitive files in working tree or history."""
-        sensitive_patterns = [
-            r'\.env$',
-            r'\.pem$',
-            r'\.key$',
-            r'\.pfx$',
-            r'\.p12$',
-            r'id_rsa$',
-            r'id_dsa$',
-            r'credentials\.json$',
-            r'secret.*\.json$',
-            r'\.aws/credentials$',
-            r'\.ssh/id_',
-            r'password.*\.txt$',
-            r'private.*\.key$',
-        ]
-        
-        found_files = set()
-        
-        # Check working tree
-        try:
-            files = self._run_git("ls-files")
-            for file in files.split('\n'):
-                for pattern in sensitive_patterns:
-                    if re.search(pattern, file, re.IGNORECASE):
-                        found_files.add(file)
-        except subprocess.CalledProcessError:
-            pass
-        
-        # Check history (limit to recent commits for performance)
-        try:
-            objects = self._run_git("rev-list", "--objects", "--all", "--max-count=1000")
-            for line in objects.split('\n'):
-                if not line.strip():
-                    continue
-                
-                parts = line.split(None, 1)
-                if len(parts) < 2:
-                    continue
-                
-                filename = parts[1]
-                for pattern in sensitive_patterns:
-                    if re.search(pattern, filename, re.IGNORECASE):
-                        found_files.add(filename + " (history)")
-        except subprocess.CalledProcessError:
-            pass
-        
-        if found_files:
-            self.findings.append(Finding(
-                "GA010",
-                Severity.ERROR,
-                "Sensitive files detected",
-                f"Found {len(found_files)} potential sensitive file(s)",
-                {"files": sorted(list(found_files))[:20]}
-            ))
-    
-    def check_shallow_clone(self) -> None:
-        """GA011: Check if repository is a shallow clone."""
-        git_dir = self._get_git_dir()
-        shallow_file = git_dir / "shallow"
-        
-        if shallow_file.exists():
-            self.findings.append(Finding(
-                "GA011",
-                Severity.INFO,
-                "Shallow clone detected",
-                "Repository is a shallow clone with limited history",
-                {}
-            ))
-    
-    def check_submodule_health(self) -> None:
-        """GA012: Check submodule health."""
-        try:
-            # Check if there are submodules
-            submodules = self._run_git("submodule", "status")
-            if not submodules:
-                return
-            
-            issues = []
-            
-            for line in submodules.split('\n'):
-                if not line.strip():
-                    continue
-                
-                # Status prefix: '-' = not initialized, '+' = different commit, 'U' = conflicts
-                if line.startswith('-'):
-                    issues.append(f"Not initialized: {line[1:].split()[1]}")
-                elif line.startswith('+'):
-                    issues.append(f"Different commit: {line[1:].split()[1]}")
-                elif line.startswith('U'):
-                    issues.append(f"Merge conflicts: {line[1:].split()[1]}")
-            
-            # Check for detached HEAD in submodules
-            try:
-                foreach_out = self._run_git("submodule", "foreach", "--quiet", 
-                                           "git symbolic-ref -q HEAD || echo DETACHED")
-                if "DETACHED" in foreach_out:
-                    detached_count = foreach_out.count("DETACHED")
-                    issues.append(f"{detached_count} submodule(s) with detached HEAD")
-            except subprocess.CalledProcessError:
+                size = os.path.getsize(fpath)
+                if size > threshold_kb * 1024:
+                    rel = os.path.relpath(fpath, repo_path)
+                    findings.append({
+                        "rule": "GA001",
+                        "severity": "WARNING",
+                        "message": f"Large file: {rel} ({_fmt_size(size)})",
+                        "file": rel,
+                        "detail": f"Files over {threshold_kb}KB should use Git LFS or be gitignored",
+                    })
+            except OSError:
                 pass
-            
-            if issues:
-                self.findings.append(Finding(
-                    "GA012",
-                    Severity.WARNING,
-                    "Submodule issues detected",
-                    f"Found {len(issues)} submodule issue(s)",
-                    {"issues": issues}
-                ))
-        except subprocess.CalledProcessError:
-            pass
-    
-    def calculate_grade(self) -> str:
-        """Calculate overall repository grade (A-F)."""
-        # Scoring: start at 100, deduct points for findings
-        score = 100
-        
-        for finding in self.findings:
-            if finding.severity == Severity.ERROR:
-                score -= 20
-            elif finding.severity == Severity.WARNING:
-                score -= 10
-            elif finding.severity == Severity.INFO:
-                score -= 3
-        
-        # Convert to letter grade
-        if score >= 90:
-            return 'A'
-        elif score >= 80:
-            return 'B'
-        elif score >= 70:
-            return 'C'
-        elif score >= 60:
-            return 'D'
-        else:
-            return 'F'
-    
-    def get_results(self) -> Dict[str, Any]:
-        """Get audit results as a dictionary."""
-        return {
-            "repository": str(self.repo_path),
-            "grade": self.calculate_grade(),
-            "findings": [f.to_dict() for f in self.findings],
-            "summary": {
-                "total": len(self.findings),
-                "errors": sum(1 for f in self.findings if f.severity == Severity.ERROR),
-                "warnings": sum(1 for f in self.findings if f.severity == Severity.WARNING),
-                "info": sum(1 for f in self.findings if f.severity == Severity.INFO),
-            }
-        }
+    return findings
 
 
-def format_text_output(results: Dict[str, Any], min_severity: str = "INFO", 
-                       quiet: bool = False) -> str:
-    """Format results as human-readable text."""
-    output = []
-    
-    if not quiet:
-        output.append("=" * 70)
-        output.append(f"Git Repository Audit: {results['repository']}")
-        output.append("=" * 70)
-        output.append("")
-    
-    severity_order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
-    min_level = severity_order.get(min_severity, 2)
-    
-    findings = [f for f in results['findings'] 
-                if severity_order.get(f['severity'], 2) <= min_level]
-    
-    if not quiet and findings:
-        for finding in findings:
-            severity_icon = {
-                "ERROR": "❌",
-                "WARNING": "⚠️ ",
-                "INFO": "ℹ️ "
-            }.get(finding['severity'], "•")
-            
-            output.append(f"{severity_icon} [{finding['check_id']}] {finding['title']}")
-            output.append(f"   Severity: {finding['severity']}")
-            output.append(f"   {finding['description']}")
-            
-            if finding['details']:
-                # Format details nicely
-                for key, value in finding['details'].items():
-                    if isinstance(value, list) and value:
-                        output.append(f"   {key}:")
-                        for item in value[:5]:  # Limit display
-                            if isinstance(item, dict):
-                                output.append(f"      • {item}")
-                            else:
-                                output.append(f"      • {item}")
-                        if len(value) > 5:
-                            output.append(f"      ... and {len(value) - 5} more")
-                    elif not isinstance(value, (list, dict)):
-                        output.append(f"   {key}: {value}")
-            
-            output.append("")
-    
-    # Summary
-    output.append("=" * 70)
-    output.append("SUMMARY")
-    output.append("=" * 70)
-    
-    grade = results['grade']
-    grade_color = {
-        'A': '🟢',
-        'B': '🟢',
-        'C': '🟡',
-        'D': '🟠',
-        'F': '🔴'
-    }.get(grade, '⚪')
-    
-    output.append(f"Overall Grade: {grade_color} {grade}")
-    output.append(f"Total Findings: {results['summary']['total']}")
-    output.append(f"  Errors:   {results['summary']['errors']}")
-    output.append(f"  Warnings: {results['summary']['warnings']}")
-    output.append(f"  Info:     {results['summary']['info']}")
-    output.append("=" * 70)
-    
-    return '\n'.join(output)
+def check_large_blobs_history(repo_path, threshold_kb=1000, limit=20):
+    """Find large blobs in git history."""
+    findings = []
+    # Get all blobs with sizes
+    out, code = git("rev-list", "--objects", "--all", cwd=repo_path)
+    if code != 0 or not out:
+        return findings
+
+    # Use verify-pack on pack files for efficient size checking
+    git_dir, _ = git("rev-parse", "--git-dir", cwd=repo_path)
+    if not git_dir:
+        return findings
+
+    pack_dir = os.path.join(repo_path, git_dir, "objects", "pack")
+    if not os.path.isdir(pack_dir):
+        return findings
+
+    large_blobs = []
+    for pf in os.listdir(pack_dir):
+        if pf.endswith(".idx"):
+            pack_path = os.path.join(pack_dir, pf)
+            vp_out, vp_code = git("verify-pack", "-v", pack_path, cwd=repo_path)
+            if vp_code != 0:
+                continue
+            for line in vp_out.split("\n"):
+                parts = line.split()
+                if len(parts) >= 4 and parts[1] == "blob":
+                    try:
+                        size = int(parts[2])
+                        if size > threshold_kb * 1024:
+                            large_blobs.append((parts[0], size))
+                    except (ValueError, IndexError):
+                        pass
+
+    # Map blob hashes to file paths
+    if large_blobs:
+        obj_map = {}
+        for line in out.split("\n"):
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                obj_map[parts[0]] = parts[1]
+
+        large_blobs.sort(key=lambda x: -x[1])
+        for blob_hash, size in large_blobs[:limit]:
+            path = obj_map.get(blob_hash, blob_hash[:12])
+            findings.append({
+                "rule": "GA002",
+                "severity": "WARNING",
+                "message": f"Large blob in history: {path} ({_fmt_size(size)})",
+                "file": path,
+                "detail": f"Consider using `git filter-branch` or BFG to clean history",
+            })
+
+    return findings
 
 
-def list_checks() -> str:
-    """Return a formatted list of all checks."""
-    checks = [
-        ("GA001", "WARNING", "Large files in history", 
-         "Find files over threshold in git history"),
-        ("GA002", "INFO", "Large repo size", 
-         "Check total .git directory size"),
-        ("GA003", "WARNING", "Stale branches", 
-         "Remote-tracking branches with no recent commits"),
-        ("GA004", "INFO", "Orphan tags", 
-         "Tags pointing to unreachable commits"),
-        ("GA005", "WARNING", "Missing .gitignore", 
-         "Missing or incomplete .gitignore file"),
-        ("GA006", "INFO", "Unsigned commits", 
-         "Percentage of commits without GPG/SSH signatures"),
-        ("GA007", "INFO", "Inconsistent commit messages", 
-         "Mix of conventional commits and freeform, WIP commits"),
-        ("GA008", "INFO", "Unmerged branches", 
-         "Local branches significantly diverged from main"),
-        ("GA009", "WARNING", "Missing LICENSE", 
-         "No LICENSE or COPYING file"),
-        ("GA010", "ERROR", "Sensitive files committed", 
-         "Potential secrets like .env, *.pem, *.key files"),
-        ("GA011", "INFO", "Shallow clone detected", 
-         "Repository is a shallow clone"),
-        ("GA012", "WARNING", "Submodule health", 
-         "Submodules with issues (detached HEAD, dirty state)"),
+def check_secrets(repo_path):
+    """Scan tracked files for potential secrets."""
+    findings = []
+    patterns = [
+        ("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
+        ("AWS Secret Key", r"(?i)aws.{0,20}secret.{0,20}['\"][0-9a-zA-Z/+=]{40}['\"]"),
+        ("GitHub Token", r"ghp_[a-zA-Z0-9]{36}"),
+        ("GitHub PAT", r"github_pat_[a-zA-Z0-9_]{22,}"),
+        ("Generic API Key", r"(?i)(api[_-]?key|apikey)\s*[:=]\s*['\"][a-zA-Z0-9_\-]{20,}['\"]"),
+        ("Generic Secret", r"(?i)(secret|password|passwd|pwd)\s*[:=]\s*['\"][^\s'\"]{8,}['\"]"),
+        ("Private Key", r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+        ("Slack Token", r"xox[bpors]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,34}"),
+        ("Stripe Key", r"sk_(live|test)_[a-zA-Z0-9]{24,}"),
+        ("JWT", r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}"),
+        ("Database URL", r"(?i)(postgres|mysql|mongodb|redis)://[^\s\"']+:[^\s\"']+@"),
     ]
-    
-    output = ["Available Checks:", "=" * 70]
-    for check_id, severity, title, description in checks:
-        output.append(f"{check_id} [{severity:7}] {title}")
-        output.append(f"         {description}")
-        output.append("")
-    
-    return '\n'.join(output)
+
+    # Get tracked files
+    out, code = git("ls-files", cwd=repo_path)
+    if code != 0:
+        return findings
+
+    binary_exts = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
+                   ".ttf", ".eot", ".pdf", ".zip", ".gz", ".tar", ".bin",
+                   ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".class"}
+
+    for fpath in out.split("\n"):
+        if not fpath.strip():
+            continue
+        _, ext = os.path.splitext(fpath.lower())
+        if ext in binary_exts:
+            continue
+
+        full_path = os.path.join(repo_path, fpath)
+        if not os.path.isfile(full_path):
+            continue
+
+        try:
+            with open(full_path, "r", errors="ignore") as f:
+                content = f.read(100000)  # Cap at 100KB per file
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        for name, pattern in patterns:
+            for match in re.finditer(pattern, content):
+                # Find line number
+                line_num = content[:match.start()].count("\n") + 1
+                snippet = match.group(0)[:60]
+                # Mask the middle
+                if len(snippet) > 20:
+                    snippet = snippet[:10] + "..." + snippet[-6:]
+
+                findings.append({
+                    "rule": "GA003",
+                    "severity": "CRITICAL",
+                    "message": f"Potential {name} in {fpath}:{line_num}",
+                    "file": fpath,
+                    "line": line_num,
+                    "detail": f"Pattern: {snippet}",
+                })
+
+    return findings
+
+
+def check_gitignore(repo_path):
+    """Check for missing common .gitignore patterns."""
+    findings = []
+    gitignore_path = os.path.join(repo_path, ".gitignore")
+
+    if not os.path.exists(gitignore_path):
+        findings.append({
+            "rule": "GA004",
+            "severity": "WARNING",
+            "message": "No .gitignore file found",
+            "file": ".gitignore",
+            "detail": "Create a .gitignore to prevent committing unwanted files",
+        })
+        return findings
+
+    try:
+        with open(gitignore_path) as f:
+            content = f.read()
+    except OSError:
+        return findings
+
+    # Detect project type and check for expected patterns
+    tracked, _ = git("ls-files", cwd=repo_path)
+    tracked_files = set(tracked.split("\n")) if tracked else set()
+
+    checks = []
+
+    # Python
+    if any(f.endswith(".py") for f in tracked_files):
+        checks.extend([
+            ("__pycache__", "Python bytecode cache"),
+            ("*.pyc", "Python compiled files"),
+            (".venv", "Python virtual environment"),
+            ("*.egg-info", "Python egg metadata"),
+        ])
+
+    # Node
+    if "package.json" in tracked_files:
+        checks.extend([
+            ("node_modules", "Node.js dependencies (can be huge)"),
+        ])
+
+    # General
+    checks.extend([
+        (".env", "Environment files (may contain secrets)"),
+        (".DS_Store", "macOS metadata files"),
+    ])
+
+    for pattern, reason in checks:
+        # Simple check: is the pattern (or similar) in .gitignore?
+        pattern_variants = [pattern, pattern.replace("*", ""), pattern.lstrip(".")]
+        if not any(v in content for v in pattern_variants if v):
+            # Check if the file actually exists in repo
+            if pattern.startswith("*."):
+                ext = pattern[1:]
+                has_files = any(f.endswith(ext) for f in tracked_files)
+            elif pattern == "node_modules":
+                has_files = any(f.startswith("node_modules/") for f in tracked_files)
+            else:
+                has_files = any(pattern.strip(".*") in f for f in tracked_files)
+
+            severity = "WARNING" if has_files else "INFO"
+            findings.append({
+                "rule": "GA005",
+                "severity": severity,
+                "message": f"Missing .gitignore pattern: {pattern}",
+                "file": ".gitignore",
+                "detail": reason,
+            })
+
+    return findings
+
+
+def check_branches(repo_path, stale_days=90):
+    """Check for stale branches."""
+    findings = []
+
+    out, code = git("for-each-ref", "--sort=-committerdate",
+                     "--format=%(refname:short) %(committerdate:unix) %(committerdate:relative)",
+                     "refs/heads/", cwd=repo_path)
+    if code != 0 or not out:
+        return findings
+
+    import time
+    now = time.time()
+    stale_threshold = now - (stale_days * 86400)
+
+    for line in out.split("\n"):
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        branch = parts[0]
+        try:
+            commit_time = int(parts[1])
+        except ValueError:
+            continue
+        relative = parts[2]
+
+        if commit_time < stale_threshold and branch not in ("main", "master", "develop", "dev"):
+            findings.append({
+                "rule": "GA006",
+                "severity": "INFO",
+                "message": f"Stale branch: {branch} (last commit {relative})",
+                "file": branch,
+                "detail": f"Consider deleting branches with no recent activity",
+            })
+
+    return findings
+
+
+def check_conflict_markers(repo_path):
+    """Check for merge conflict markers left in tracked files."""
+    findings = []
+    out, _ = git("ls-files", cwd=repo_path)
+    if not out:
+        return findings
+
+    text_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
+                 ".c", ".cpp", ".h", ".rb", ".php", ".sh", ".yml", ".yaml",
+                 ".json", ".toml", ".md", ".txt", ".cfg", ".ini", ".html",
+                 ".css", ".scss", ".sql", ".xml", ".env", ".conf"}
+
+    for fpath in out.split("\n"):
+        if not fpath.strip():
+            continue
+        _, ext = os.path.splitext(fpath.lower())
+        if ext not in text_exts:
+            continue
+
+        full_path = os.path.join(repo_path, fpath)
+        if not os.path.isfile(full_path):
+            continue
+
+        try:
+            with open(full_path, "r", errors="ignore") as f:
+                for line_num, line in enumerate(f, 1):
+                    if line.startswith("<<<<<<< ") or line.startswith(">>>>>>> ") or line.startswith("======= "):
+                        # Avoid false positive on markdown horizontal rules
+                        if line.strip() == "=======" or line.startswith("<<<<<<< ") or line.startswith(">>>>>>> "):
+                            findings.append({
+                                "rule": "GA007",
+                                "severity": "ERROR",
+                                "message": f"Merge conflict marker in {fpath}:{line_num}",
+                                "file": fpath,
+                                "line": line_num,
+                                "detail": line.strip()[:80],
+                            })
+                            break  # One finding per file is enough
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    return findings
+
+
+def check_todos(repo_path):
+    """Track TODO/FIXME/HACK/XXX comments."""
+    findings = []
+    out, _ = git("ls-files", cwd=repo_path)
+    if not out:
+        return findings
+
+    text_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
+                 ".c", ".cpp", ".h", ".rb", ".php", ".sh", ".yml", ".yaml",
+                 ".md", ".txt", ".sql", ".html", ".css"}
+
+    pattern = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG)\b\s*:?\s*(.*)", re.IGNORECASE)
+    count = 0
+    MAX_FINDINGS = 50
+
+    for fpath in out.split("\n"):
+        if not fpath.strip() or count >= MAX_FINDINGS:
+            break
+        _, ext = os.path.splitext(fpath.lower())
+        if ext not in text_exts:
+            continue
+
+        full_path = os.path.join(repo_path, fpath)
+        if not os.path.isfile(full_path):
+            continue
+
+        try:
+            with open(full_path, "r", errors="ignore") as f:
+                for line_num, line in enumerate(f, 1):
+                    match = pattern.search(line)
+                    if match:
+                        tag = match.group(1).upper()
+                        msg = match.group(2).strip()[:80]
+                        findings.append({
+                            "rule": "GA008",
+                            "severity": "INFO",
+                            "message": f"{tag} in {fpath}:{line_num}: {msg}",
+                            "file": fpath,
+                            "line": line_num,
+                            "detail": f"{tag}: {msg}",
+                        })
+                        count += 1
+                        if count >= MAX_FINDINGS:
+                            break
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    return findings
+
+
+def check_repo_basics(repo_path):
+    """Check basic repo health: README, LICENSE, etc."""
+    findings = []
+
+    # Check for README
+    readme_found = False
+    for name in ["README.md", "README.rst", "README.txt", "README"]:
+        if os.path.exists(os.path.join(repo_path, name)):
+            readme_found = True
+            break
+    if not readme_found:
+        findings.append({
+            "rule": "GA009",
+            "severity": "WARNING",
+            "message": "No README file found",
+            "file": "",
+            "detail": "Add a README.md with project description, installation, and usage",
+        })
+
+    # Check for LICENSE
+    license_found = False
+    for name in ["LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING"]:
+        if os.path.exists(os.path.join(repo_path, name)):
+            license_found = True
+            break
+    if not license_found:
+        findings.append({
+            "rule": "GA010",
+            "severity": "WARNING",
+            "message": "No LICENSE file found",
+            "file": "",
+            "detail": "Add a LICENSE file to clarify usage terms",
+        })
+
+    # Check for uncommitted changes
+    status, code = git("status", "--porcelain", cwd=repo_path)
+    if status:
+        lines = [l for l in status.split("\n") if l.strip()]
+        findings.append({
+            "rule": "GA011",
+            "severity": "INFO",
+            "message": f"Uncommitted changes: {len(lines)} file(s)",
+            "file": "",
+            "detail": "Consider committing or stashing changes",
+        })
+
+    return findings
+
+
+# ── Grading ────────────────────────────────────────────────────────────────
+
+def grade_findings(findings):
+    """Compute a health score from findings."""
+    score = 100
+    for f in findings:
+        sev = f["severity"]
+        if sev == "CRITICAL":
+            score -= 15
+        elif sev == "ERROR":
+            score -= 10
+        elif sev == "WARNING":
+            score -= 3
+        # INFO doesn't reduce score
+
+    score = max(0, min(100, score))
+
+    if score >= 90:
+        grade = "A"
+    elif score >= 80:
+        grade = "B"
+    elif score >= 70:
+        grade = "C"
+    elif score >= 60:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return grade, score
+
+
+# ── Formatting helpers ────────────────────────────────────────────────────
+
+def _fmt_size(nbytes):
+    if nbytes >= 1024 * 1024:
+        return f"{nbytes / (1024*1024):.1f} MB"
+    elif nbytes >= 1024:
+        return f"{nbytes / 1024:.1f} KB"
+    return f"{nbytes} B"
+
+
+SEVERITY_ICON = {
+    "CRITICAL": f"{C.RED}🚨",
+    "ERROR": f"{C.RED}✗",
+    "WARNING": f"{C.YELLOW}⚠",
+    "INFO": f"{C.BLUE}ℹ",
+}
+
+SEVERITY_ORDER = {"CRITICAL": 0, "ERROR": 1, "WARNING": 2, "INFO": 3}
+
+
+# ── Output Formatters ─────────────────────────────────────────────────────
+
+def format_text(repo_path, findings, grade, score, verbose=False):
+    lines = []
+    lines.append(f"\n{C.BOLD}gitaudit v{__version__}{C.RESET} — Git Repository Health Checker\n")
+    lines.append(f"  Repo: {C.BOLD}{repo_path}{C.RESET}")
+
+    grade_color = C.GREEN if grade in ("A", "B") else (C.YELLOW if grade == "C" else C.RED)
+    lines.append(f"  Health: {grade_color}{C.BOLD}{grade}{C.RESET} ({score}/100)\n")
+
+    if not findings:
+        lines.append(f"  {C.GREEN}✓ No issues found — clean repo!{C.RESET}\n")
+        return "\n".join(lines)
+
+    # Group by rule
+    by_severity = {"CRITICAL": [], "ERROR": [], "WARNING": [], "INFO": []}
+    for f in findings:
+        by_severity.get(f["severity"], by_severity["INFO"]).append(f)
+
+    for sev in ["CRITICAL", "ERROR", "WARNING", "INFO"]:
+        group = by_severity[sev]
+        if not group:
+            continue
+        if sev == "INFO" and not verbose:
+            lines.append(f"\n  {C.DIM}{len(group)} info item(s) (use --verbose to show){C.RESET}")
+            continue
+
+        icon = SEVERITY_ICON.get(sev, "")
+        for f in group:
+            lines.append(f"  {icon}{C.RESET} [{f['rule']}] {f['message']}")
+            if verbose and f.get("detail"):
+                lines.append(f"    {C.DIM}→ {f['detail']}{C.RESET}")
+
+    # Summary
+    counts = {s: len(by_severity[s]) for s in by_severity}
+    lines.append(f"\n{C.BOLD}Summary:{C.RESET} "
+                 f"{counts['CRITICAL']} critical, {counts['ERROR']} errors, "
+                 f"{counts['WARNING']} warnings, {counts['INFO']} info\n")
+
+    return "\n".join(lines)
+
+
+def format_json(repo_path, findings, grade, score):
+    output = {
+        "version": __version__,
+        "repo": repo_path,
+        "grade": grade,
+        "score": score,
+        "total_findings": len(findings),
+        "counts": {
+            "critical": len([f for f in findings if f["severity"] == "CRITICAL"]),
+            "error": len([f for f in findings if f["severity"] == "ERROR"]),
+            "warning": len([f for f in findings if f["severity"] == "WARNING"]),
+            "info": len([f for f in findings if f["severity"] == "INFO"]),
+        },
+        "findings": findings,
+    }
+    return json.dumps(output, indent=2)
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+ALL_CHECKS = {
+    "size": ("Large files in working tree", check_large_files),
+    "history": ("Large blobs in git history", check_large_blobs_history),
+    "secrets": ("Potential secrets in code", check_secrets),
+    "gitignore": ("Missing .gitignore patterns", check_gitignore),
+    "branches": ("Stale branches", check_branches),
+    "conflicts": ("Merge conflict markers", check_conflict_markers),
+    "todos": ("TODO/FIXME tracking", check_todos),
+    "basics": ("Repo basics (README, LICENSE)", check_repo_basics),
+}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Git Repository Hygiene Auditor - Audit your git repo health",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="gitaudit",
+        description="Git Repository Health Checker — audit repos for large files, secrets, stale branches, and more.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              gitaudit                         Audit current repo (all checks)
+              gitaudit /path/to/repo           Audit specific repo
+              gitaudit --check secrets         Only check for secrets
+              gitaudit --check size,secrets    Run specific checks
+              gitaudit --json                  JSON output
+              gitaudit --verbose               Show all findings including INFO
+              gitaudit --ci                    CI mode: exit 1 on errors/criticals
+
+            checks:
+              size       Large files in working tree (>500KB)
+              history    Large blobs in git history (>1MB)
+              secrets    Potential secrets (API keys, tokens, passwords)
+              gitignore  Missing .gitignore patterns
+              branches   Stale branches (>90 days)
+              conflicts  Merge conflict markers left in code
+              todos      TODO/FIXME/HACK tracking
+              basics     README, LICENSE, uncommitted changes
+        """),
     )
-    
-    parser.add_argument(
-        "repo_path",
-        nargs="?",
-        default=".",
-        help="Path to git repository (default: current directory)"
-    )
-    
-    parser.add_argument(
-        "--format",
-        choices=["text", "json"],
-        default="text",
-        help="Output format (default: text)"
-    )
-    
-    parser.add_argument(
-        "--severity",
-        choices=["info", "warning", "error"],
-        default="info",
-        help="Minimum severity to show (default: info)"
-    )
-    
-    parser.add_argument(
-        "--ignore",
-        action="append",
-        dest="ignored_checks",
-        metavar="CHECK_ID",
-        help="Ignore specific checks (can be repeated)"
-    )
-    
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="CI mode: exit 1 if grade below threshold"
-    )
-    
-    parser.add_argument(
-        "--min-grade",
-        choices=["A", "B", "C", "D"],
-        default="C",
-        help="Minimum passing grade for --check mode (default: C)"
-    )
-    
-    parser.add_argument(
-        "--list-checks",
-        action="store_true",
-        help="Show all available checks and exit"
-    )
-    
-    parser.add_argument(
-        "--max-file-size",
-        type=int,
-        default=5,
-        metavar="MB",
-        help="Large file threshold in MB (default: 5)"
-    )
-    
-    parser.add_argument(
-        "--stale-days",
-        type=int,
-        default=90,
-        metavar="N",
-        help="Days before branch is considered stale (default: 90)"
-    )
-    
-    parser.add_argument(
-        "-q", "--quiet",
-        action="store_true",
-        help="Only show summary grade"
-    )
-    
+
+    parser.add_argument("repo", nargs="?", default=".", help="Repository path (default: current directory)")
+    parser.add_argument("--check", "-c", metavar="CHECKS",
+                        help="Run specific checks (comma-separated: size,secrets,branches,...)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show all findings including INFO")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="JSON output")
+    parser.add_argument("--ci", action="store_true", help="CI mode: exit 1 if any CRITICAL or ERROR findings")
+    parser.add_argument("--list-checks", action="store_true", help="List all available checks")
+    parser.add_argument("--version", action="version", version=f"gitaudit {__version__}")
+
     args = parser.parse_args()
-    
+
     if args.list_checks:
-        print(list_checks())
-        return 0
-    
-    try:
-        auditor = GitAuditor(
-            args.repo_path,
-            max_file_size_mb=args.max_file_size,
-            stale_days=args.stale_days,
-            ignored_checks=args.ignored_checks or []
-        )
-        
-        auditor.run_all_checks()
-        results = auditor.get_results()
-        
-        if args.format == "json":
-            print(json.dumps(results, indent=2))
-        else:
-            print(format_text_output(
-                results, 
-                min_severity=args.severity.upper(),
-                quiet=args.quiet
-            ))
-        
-        # CI mode check
-        if args.check:
-            grade_order = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
-            actual_grade = results['grade']
-            min_grade = args.min_grade
-            
-            if grade_order[actual_grade] < grade_order[min_grade]:
-                return 1
-        
-        return 0
-        
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("\nAudit interrupted", file=sys.stderr)
-        return 130
+        print(f"\n{C.BOLD}Available checks:{C.RESET}\n")
+        for name, (desc, _) in ALL_CHECKS.items():
+            print(f"  {C.CYAN}{name:12s}{C.RESET} {desc}")
+        print()
+        sys.exit(0)
+
+    repo_path = os.path.abspath(args.repo)
+
+    if not is_git_repo(repo_path):
+        print(f"Error: {repo_path} is not a git repository.", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine which checks to run
+    if args.check:
+        check_names = [c.strip() for c in args.check.split(",")]
+        for cn in check_names:
+            if cn not in ALL_CHECKS:
+                print(f"Error: Unknown check '{cn}'. Use --list-checks to see available checks.", file=sys.stderr)
+                sys.exit(1)
+    else:
+        check_names = list(ALL_CHECKS.keys())
+
+    # Run checks
+    all_findings = []
+    if not args.json_output:
+        print(f"\n{C.BOLD}gitaudit v{__version__}{C.RESET} — Scanning...\n")
+
+    for check_name in check_names:
+        desc, check_fn = ALL_CHECKS[check_name]
+        if not args.json_output:
+            print(f"  {C.DIM}⏳ {desc}...{C.RESET}", flush=True)
+        findings = check_fn(repo_path)
+        all_findings.extend(findings)
+
+    # Sort by severity
+    all_findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
+
+    # Grade
+    grade, score = grade_findings(all_findings)
+
+    # Output
+    if args.json_output:
+        print(format_json(repo_path, all_findings, grade, score))
+    else:
+        print(format_text(repo_path, all_findings, grade, score, verbose=args.verbose))
+
+    # CI mode
+    if args.ci:
+        has_critical = any(f["severity"] in ("CRITICAL", "ERROR") for f in all_findings)
+        sys.exit(1 if has_critical else 0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
