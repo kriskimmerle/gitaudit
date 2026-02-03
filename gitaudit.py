@@ -1,684 +1,816 @@
 #!/usr/bin/env python3
-"""gitaudit - Git Repository Health Checker
+"""gitaudit - Git Repository Health & Security Auditor.
 
-Audit a git repo for common issues: large files in history, potential secrets
-in commits, stale branches, missing .gitignore patterns, merge conflict
-markers, TODO/FIXME tracking, and more. Like a linter for your repo itself.
+Zero-dependency tool that audits a Git repository for security issues,
+health problems, and best practice violations. Covers secrets, large files,
+binary files, merge conflicts, .gitignore gaps, stale branches, and more.
 
 Usage:
-    gitaudit                        Audit current repo
-    gitaudit /path/to/repo          Audit specific repo
-    gitaudit --check secrets        Only check for secrets
-    gitaudit --json                 JSON output
-    gitaudit --check size           Only check large files
-    gitaudit --verbose              Show all findings with details
-
-Author: github.com/kriskimmerle
-License: MIT
+    gitaudit [path]
+    gitaudit --check --min-score 80 .
+    gitaudit --json .
 """
 
-__version__ = "1.0.0"
+from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
 import subprocess
 import sys
-import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-# ── ANSI colors ────────────────────────────────────────────────────────────
+__version__ = "0.1.0"
 
-class C:
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    CYAN = "\033[96m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+SEVERITY_INFO = "info"
 
-NO_COLOR = os.environ.get("NO_COLOR") is not None or not sys.stdout.isatty()
-if NO_COLOR:
-    for attr in ("RED", "GREEN", "YELLOW", "BLUE", "CYAN", "BOLD", "DIM", "RESET"):
-        setattr(C, attr, "")
+RULES: dict[str, dict[str, str]] = {
+    "GIT001": {
+        "name": "sensitive-file-tracked",
+        "severity": SEVERITY_ERROR,
+        "message": "Sensitive file tracked in repository",
+        "fix": "Remove the file from tracking: git rm --cached {path} && add to .gitignore",
+    },
+    "GIT002": {
+        "name": "secret-in-file",
+        "severity": SEVERITY_ERROR,
+        "message": "Potential secret/credential detected in tracked file",
+        "fix": "Remove the secret, rotate the credential, and use environment variables instead",
+    },
+    "GIT003": {
+        "name": "large-file",
+        "severity": SEVERITY_WARNING,
+        "message": "Large file tracked (consider Git LFS)",
+        "fix": "Use git lfs track '{pattern}' for large files",
+    },
+    "GIT004": {
+        "name": "binary-file",
+        "severity": SEVERITY_INFO,
+        "message": "Binary file tracked in repository",
+        "fix": "Consider using Git LFS for binary files, or add to .gitignore if generated",
+    },
+    "GIT005": {
+        "name": "merge-conflict-marker",
+        "severity": SEVERITY_ERROR,
+        "message": "Merge conflict marker found in file",
+        "fix": "Resolve the merge conflict and remove the conflict markers",
+    },
+    "GIT006": {
+        "name": "missing-gitignore",
+        "severity": SEVERITY_WARNING,
+        "message": "No .gitignore file found",
+        "fix": "Create a .gitignore — see github.com/github/gitignore for templates",
+    },
+    "GIT007": {
+        "name": "gitignore-gap",
+        "severity": SEVERITY_INFO,
+        "message": "Common pattern missing from .gitignore",
+        "fix": "Add '{pattern}' to .gitignore",
+    },
+    "GIT008": {
+        "name": "stale-branch",
+        "severity": SEVERITY_INFO,
+        "message": "Stale branch (no commits in 90+ days)",
+        "fix": "Delete stale branches: git branch -d {branch} or git push origin --delete {branch}",
+    },
+    "GIT009": {
+        "name": "mixed-line-endings",
+        "severity": SEVERITY_INFO,
+        "message": "Mixed line endings detected (CRLF + LF)",
+        "fix": "Normalize line endings: add '* text=auto' to .gitattributes",
+    },
+    "GIT010": {
+        "name": "empty-commit-message",
+        "severity": SEVERITY_INFO,
+        "message": "Commit with empty or trivial message",
+        "fix": "Write meaningful commit messages describing what changed and why",
+    },
+    "GIT011": {
+        "name": "submodule-http",
+        "severity": SEVERITY_WARNING,
+        "message": "Git submodule uses HTTP (not HTTPS)",
+        "fix": "Update submodule URL to use HTTPS for secure transport",
+    },
+    "GIT012": {
+        "name": "no-gitattributes",
+        "severity": SEVERITY_INFO,
+        "message": "No .gitattributes file — line ending normalization not configured",
+        "fix": "Create .gitattributes with '* text=auto' for consistent line endings",
+    },
+    "GIT013": {
+        "name": "tracked-generated-file",
+        "severity": SEVERITY_INFO,
+        "message": "Generated/build artifact tracked in repository",
+        "fix": "Add '{path}' to .gitignore and remove from tracking: git rm --cached {path}",
+    },
+    "GIT014": {
+        "name": "symlink-in-repo",
+        "severity": SEVERITY_INFO,
+        "message": "Symlink tracked in repository (may not work cross-platform)",
+        "fix": "Consider replacing symlinks with copies or relative paths for portability",
+    },
+    "GIT015": {
+        "name": "deep-nesting",
+        "severity": SEVERITY_INFO,
+        "message": "Deeply nested file path (>8 levels) — may cause issues on Windows",
+        "fix": "Consider flattening directory structure for cross-platform compatibility",
+    },
+}
+
+# ── Sensitive file patterns ──────────────────────────────────────────────────
+
+SENSITIVE_FILE_PATTERNS: list[tuple[str, str]] = [
+    (r"\.env$", ".env file (environment variables/secrets)"),
+    (r"\.env\.\w+$", ".env variant file"),
+    (r"id_rsa$", "SSH private key"),
+    (r"id_dsa$", "DSA private key"),
+    (r"id_ecdsa$", "ECDSA private key"),
+    (r"id_ed25519$", "Ed25519 private key"),
+    (r"\.pem$", "PEM certificate/key"),
+    (r"\.key$", "Private key file"),
+    (r"\.p12$", "PKCS12 keystore"),
+    (r"\.pfx$", "PFX certificate"),
+    (r"\.jks$", "Java keystore"),
+    (r"\.keystore$", "Keystore file"),
+    (r"\.kdbx?$", "KeePass database"),
+    (r"htpasswd$", "Apache htpasswd"),
+    (r"\.netrc$", ".netrc credentials"),
+    (r"credentials\.json$", "Credentials file"),
+    (r"secrets\.ya?ml$", "Secrets file"),
+    (r"secrets\.json$", "Secrets file"),
+    (r"\.secret$", "Secret file"),
+    (r"master\.key$", "Rails master key"),
+    (r"\.npmrc$", "npm credentials"),
+    (r"\.pypirc$", "PyPI credentials"),
+    (r"\.gem/credentials$", "RubyGems credentials"),
+    (r"token\.json$", "Token file"),
+]
+
+SENSITIVE_FILE_RES = [(re.compile(p, re.IGNORECASE), desc) for p, desc in SENSITIVE_FILE_PATTERNS]
+
+# ── Secret patterns ──────────────────────────────────────────────────────────
+
+SECRET_PATTERNS: list[tuple[str, str]] = [
+    (r"ghp_[a-zA-Z0-9]{36}", "GitHub Personal Access Token"),
+    (r"gho_[a-zA-Z0-9]{36}", "GitHub OAuth Token"),
+    (r"github_pat_[a-zA-Z0-9_]{22,}", "GitHub PAT (fine-grained)"),
+    (r"sk-[a-zA-Z0-9]{48}", "OpenAI API Key"),
+    (r"sk-proj-[a-zA-Z0-9_-]+", "OpenAI Project API Key"),
+    (r"sk-ant-[a-zA-Z0-9_-]+", "Anthropic API Key"),
+    (r"AKIA[0-9A-Z]{16}", "AWS Access Key ID"),
+    (r"xoxb-[0-9]{11,}-[0-9]{11,}-[a-zA-Z0-9]{24}", "Slack Bot Token"),
+    (r"xoxp-[0-9]{11,}-[0-9]{11,}-[0-9]{11,}-[a-f0-9]{32}", "Slack User Token"),
+    (r"SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}", "SendGrid API Key"),
+    (r"sk_live_[a-zA-Z0-9]{24,}", "Stripe Live Key"),
+    (r"rk_live_[a-zA-Z0-9]{24,}", "Stripe Restricted Key"),
+    (r"-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----", "Private Key"),
+    (r"AIza[0-9A-Za-z_-]{35}", "Google API Key"),
+    (r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com", "Google OAuth Client ID"),
+    (r"ya29\.[0-9A-Za-z_-]+", "Google OAuth Token"),
+    (r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+", "JWT Token"),
+    (r"(?i)(password|passwd|pwd)\s*[=:]\s*['\"][^'\"]{8,}['\"]", "Hardcoded Password"),
+    (r"(?i)(api[_-]?key|apikey)\s*[=:]\s*['\"][a-zA-Z0-9_-]{16,}['\"]", "Hardcoded API Key"),
+    (r"(?i)(secret[_-]?key|secret)\s*[=:]\s*['\"][a-zA-Z0-9_-]{16,}['\"]", "Hardcoded Secret"),
+]
+
+SECRET_RES = [(re.compile(p), desc) for p, desc in SECRET_PATTERNS]
+
+# ── Binary file extensions ───────────────────────────────────────────────────
+
+BINARY_EXTENSIONS = {
+    ".exe", ".dll", ".so", ".dylib", ".a", ".lib", ".o", ".obj",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".jar", ".war", ".ear", ".class",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg",
+    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".pyc", ".pyo", ".whl", ".egg",
+    ".db", ".sqlite", ".sqlite3",
+}
+
+# ── Generated/build patterns ─────────────────────────────────────────────────
+
+GENERATED_PATTERNS: list[tuple[str, str]] = [
+    (r"node_modules/", "node_modules directory"),
+    (r"__pycache__/", "__pycache__ directory"),
+    (r"\.pyc$", "Compiled Python file"),
+    (r"dist/", "Distribution directory"),
+    (r"build/", "Build directory"),
+    (r"\.egg-info/", "Egg info directory"),
+    (r"coverage\.xml$", "Coverage report"),
+    (r"\.coverage$", "Coverage data"),
+    (r"htmlcov/", "HTML coverage report"),
+    (r"\.tox/", "Tox directory"),
+    (r"\.pytest_cache/", "Pytest cache"),
+    (r"\.mypy_cache/", "Mypy cache"),
+    (r"package-lock\.json$", "npm lock file (optional to track)"),
+]
+
+GENERATED_RES = [(re.compile(p), desc) for p, desc in GENERATED_PATTERNS]
+
+# ── Gitignore recommended patterns ──────────────────────────────────────────
+
+GITIGNORE_PATTERNS: dict[str, list[str]] = {
+    "Python": ["__pycache__/", "*.pyc", "*.pyo", "dist/", "build/", "*.egg-info/",
+               ".eggs/", ".venv/", "venv/", ".env", ".mypy_cache/", ".pytest_cache/"],
+    "Node.js": ["node_modules/", ".env", "dist/"],
+    "General": [".DS_Store", "Thumbs.db", "*.swp", "*.swo", "*~", ".idea/", ".vscode/"],
+}
+
+# ── Merge conflict markers ───────────────────────────────────────────────────
+
+CONFLICT_MARKER_RE = re.compile(r"^(<{7}\s|={7}$|>{7}\s)", re.MULTILINE)
+
+# ── Trivial commit messages ──────────────────────────────────────────────────
+
+TRIVIAL_MESSAGES = re.compile(
+    r"^(fix|update|changes?|wip|tmp|test|asdf|aaa|xxx|yyy|todo|stuff|"
+    r"\.\.\.|---|\?\?\?|!!!)$",
+    re.IGNORECASE,
+)
 
 
-# ── Git helpers ────────────────────────────────────────────────────────────
+# ── Finding ──────────────────────────────────────────────────────────────────
 
-def git(*args, cwd=None):
+
+@dataclass
+class Finding:
+    rule: str
+    severity: str
+    message: str
+    file: str = ""
+    line: int = 0
+    context: str = ""
+    fix: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"rule": self.rule, "severity": self.severity, "message": self.message}
+        if self.file:
+            d["file"] = self.file
+        if self.line:
+            d["line"] = self.line
+        if self.context:
+            d["context"] = self.context
+        if self.fix:
+            d["fix"] = self.fix
+        return d
+
+
+# ── Git helpers ──────────────────────────────────────────────────────────────
+
+
+def _git(args: list[str], cwd: str) -> str:
     """Run a git command and return stdout."""
     try:
         result = subprocess.run(
-            ["git"] + list(args),
-            cwd=cwd, capture_output=True, text=True, timeout=30,
+            ["git"] + args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        return result.stdout.strip(), result.returncode
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return "", 1
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
 
 
-def is_git_repo(path):
-    """Check if path is inside a git repo."""
-    _, code = git("rev-parse", "--git-dir", cwd=path)
-    return code == 0
+def _git_ls_files(cwd: str) -> list[str]:
+    """Get list of tracked files."""
+    out = _git(["ls-files"], cwd)
+    return out.splitlines() if out else []
 
 
-# ── Audit Checks ──────────────────────────────────────────────────────────
-
-def check_large_files(repo_path, threshold_kb=500):
-    """Find large files in the working tree."""
-    findings = []
-    for root, dirs, files in os.walk(repo_path):
-        # Skip .git directory
-        dirs[:] = [d for d in dirs if d != ".git"]
-        for fname in files:
-            fpath = os.path.join(root, fname)
+def _git_file_sizes(cwd: str) -> dict[str, int]:
+    """Get sizes of tracked files via ls-tree."""
+    out = _git(["ls-tree", "-r", "-l", "HEAD"], cwd)
+    sizes: dict[str, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5:
             try:
-                size = os.path.getsize(fpath)
-                if size > threshold_kb * 1024:
-                    rel = os.path.relpath(fpath, repo_path)
-                    findings.append({
-                        "rule": "GA001",
-                        "severity": "WARNING",
-                        "message": f"Large file: {rel} ({_fmt_size(size)})",
-                        "file": rel,
-                        "detail": f"Files over {threshold_kb}KB should use Git LFS or be gitignored",
-                    })
-            except OSError:
+                size = int(parts[3])
+                path = " ".join(parts[4:])
+                sizes[path] = size
+            except (ValueError, IndexError):
                 pass
-    return findings
+    return sizes
 
 
-def check_large_blobs_history(repo_path, threshold_kb=1000, limit=20):
-    """Find large blobs in git history."""
-    findings = []
-    # Get all blobs with sizes
-    out, code = git("rev-list", "--objects", "--all", cwd=repo_path)
-    if code != 0 or not out:
-        return findings
-
-    # Use verify-pack on pack files for efficient size checking
-    git_dir, _ = git("rev-parse", "--git-dir", cwd=repo_path)
-    if not git_dir:
-        return findings
-
-    pack_dir = os.path.join(repo_path, git_dir, "objects", "pack")
-    if not os.path.isdir(pack_dir):
-        return findings
-
-    large_blobs = []
-    for pf in os.listdir(pack_dir):
-        if pf.endswith(".idx"):
-            pack_path = os.path.join(pack_dir, pf)
-            vp_out, vp_code = git("verify-pack", "-v", pack_path, cwd=repo_path)
-            if vp_code != 0:
-                continue
-            for line in vp_out.split("\n"):
-                parts = line.split()
-                if len(parts) >= 4 and parts[1] == "blob":
-                    try:
-                        size = int(parts[2])
-                        if size > threshold_kb * 1024:
-                            large_blobs.append((parts[0], size))
-                    except (ValueError, IndexError):
-                        pass
-
-    # Map blob hashes to file paths
-    if large_blobs:
-        obj_map = {}
-        for line in out.split("\n"):
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                obj_map[parts[0]] = parts[1]
-
-        large_blobs.sort(key=lambda x: -x[1])
-        for blob_hash, size in large_blobs[:limit]:
-            path = obj_map.get(blob_hash, blob_hash[:12])
-            findings.append({
-                "rule": "GA002",
-                "severity": "WARNING",
-                "message": f"Large blob in history: {path} ({_fmt_size(size)})",
-                "file": path,
-                "detail": f"Consider using `git filter-branch` or BFG to clean history",
-            })
-
-    return findings
+def _git_branches(cwd: str) -> list[tuple[str, str]]:
+    """Get branches with last commit date. Returns [(branch, iso_date), ...]."""
+    out = _git(["for-each-ref", "--sort=-committerdate",
+                "--format=%(refname:short) %(committerdate:iso8601)", "refs/heads/"], cwd)
+    branches: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            branches.append((parts[0], parts[1].strip()))
+    return branches
 
 
-def check_secrets(repo_path):
-    """Scan tracked files for potential secrets."""
-    findings = []
-    patterns = [
-        ("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
-        ("AWS Secret Key", r"(?i)aws.{0,20}secret.{0,20}['\"][0-9a-zA-Z/+=]{40}['\"]"),
-        ("GitHub Token", r"ghp_[a-zA-Z0-9]{36}"),
-        ("GitHub PAT", r"github_pat_[a-zA-Z0-9_]{22,}"),
-        ("Generic API Key", r"(?i)(api[_-]?key|apikey)\s*[:=]\s*['\"][a-zA-Z0-9_\-]{20,}['\"]"),
-        ("Generic Secret", r"(?i)(secret|password|passwd|pwd)\s*[:=]\s*['\"][^\s'\"]{8,}['\"]"),
-        ("Private Key", r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-        ("Slack Token", r"xox[bpors]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,34}"),
-        ("Stripe Key", r"sk_(live|test)_[a-zA-Z0-9]{24,}"),
-        ("JWT", r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}"),
-        ("Database URL", r"(?i)(postgres|mysql|mongodb|redis)://[^\s\"']+:[^\s\"']+@"),
-    ]
-
-    # Get tracked files
-    out, code = git("ls-files", cwd=repo_path)
-    if code != 0:
-        return findings
-
-    binary_exts = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
-                   ".ttf", ".eot", ".pdf", ".zip", ".gz", ".tar", ".bin",
-                   ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".class"}
-
-    for fpath in out.split("\n"):
-        if not fpath.strip():
-            continue
-        _, ext = os.path.splitext(fpath.lower())
-        if ext in binary_exts:
-            continue
-
-        full_path = os.path.join(repo_path, fpath)
-        if not os.path.isfile(full_path):
-            continue
-
-        try:
-            with open(full_path, "r", errors="ignore") as f:
-                content = f.read(100000)  # Cap at 100KB per file
-        except (OSError, UnicodeDecodeError):
-            continue
-
-        for name, pattern in patterns:
-            for match in re.finditer(pattern, content):
-                # Find line number
-                line_num = content[:match.start()].count("\n") + 1
-                snippet = match.group(0)[:60]
-                # Mask the middle
-                if len(snippet) > 20:
-                    snippet = snippet[:10] + "..." + snippet[-6:]
-
-                findings.append({
-                    "rule": "GA003",
-                    "severity": "CRITICAL",
-                    "message": f"Potential {name} in {fpath}:{line_num}",
-                    "file": fpath,
-                    "line": line_num,
-                    "detail": f"Pattern: {snippet}",
-                })
-
-    return findings
+def _git_recent_commits(cwd: str, n: int = 50) -> list[tuple[str, str]]:
+    """Get recent commit hashes and messages."""
+    out = _git(["log", f"-{n}", "--format=%H %s"], cwd)
+    commits: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            commits.append((parts[0], parts[1]))
+    return commits
 
 
-def check_gitignore(repo_path):
-    """Check for missing common .gitignore patterns."""
-    findings = []
-    gitignore_path = os.path.join(repo_path, ".gitignore")
-
-    if not os.path.exists(gitignore_path):
-        findings.append({
-            "rule": "GA004",
-            "severity": "WARNING",
-            "message": "No .gitignore file found",
-            "file": ".gitignore",
-            "detail": "Create a .gitignore to prevent committing unwanted files",
-        })
-        return findings
-
+def _file_content(path: str, max_bytes: int = 100_000) -> str | None:
+    """Read file content, returning None for binary files."""
     try:
-        with open(gitignore_path) as f:
-            content = f.read()
-    except OSError:
-        return findings
-
-    # Detect project type and check for expected patterns
-    tracked, _ = git("ls-files", cwd=repo_path)
-    tracked_files = set(tracked.split("\n")) if tracked else set()
-
-    checks = []
-
-    # Python
-    if any(f.endswith(".py") for f in tracked_files):
-        checks.extend([
-            ("__pycache__", "Python bytecode cache"),
-            ("*.pyc", "Python compiled files"),
-            (".venv", "Python virtual environment"),
-            ("*.egg-info", "Python egg metadata"),
-        ])
-
-    # Node
-    if "package.json" in tracked_files:
-        checks.extend([
-            ("node_modules", "Node.js dependencies (can be huge)"),
-        ])
-
-    # General
-    checks.extend([
-        (".env", "Environment files (may contain secrets)"),
-        (".DS_Store", "macOS metadata files"),
-    ])
-
-    for pattern, reason in checks:
-        # Simple check: is the pattern (or similar) in .gitignore?
-        pattern_variants = [pattern, pattern.replace("*", ""), pattern.lstrip(".")]
-        if not any(v in content for v in pattern_variants if v):
-            # Check if the file actually exists in repo
-            if pattern.startswith("*."):
-                ext = pattern[1:]
-                has_files = any(f.endswith(ext) for f in tracked_files)
-            elif pattern == "node_modules":
-                has_files = any(f.startswith("node_modules/") for f in tracked_files)
-            else:
-                has_files = any(pattern.strip(".*") in f for f in tracked_files)
-
-            severity = "WARNING" if has_files else "INFO"
-            findings.append({
-                "rule": "GA005",
-                "severity": severity,
-                "message": f"Missing .gitignore pattern: {pattern}",
-                "file": ".gitignore",
-                "detail": reason,
-            })
-
-    return findings
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes)
+        if b"\x00" in raw[:8192]:
+            return None  # Binary
+        return raw.decode("utf-8", errors="replace")
+    except (OSError, IOError):
+        return None
 
 
-def check_branches(repo_path, stale_days=90):
-    """Check for stale branches."""
-    findings = []
+# ── Auditor ──────────────────────────────────────────────────────────────────
 
-    out, code = git("for-each-ref", "--sort=-committerdate",
-                     "--format=%(refname:short) %(committerdate:unix) %(committerdate:relative)",
-                     "refs/heads/", cwd=repo_path)
-    if code != 0 or not out:
-        return findings
 
+def audit_repo(repo_path: str,
+               ignore_rules: set[str] | None = None,
+               severity_filter: str | None = None,
+               large_file_threshold: int = 1_000_000) -> tuple[list[Finding], dict[str, Any]]:
+    """Audit a git repository."""
+    ignore_rules = ignore_rules or set()
+    findings: list[Finding] = []
+    repo = str(Path(repo_path).resolve())
+
+    # Verify it's a git repo
+    git_dir = _git(["rev-parse", "--git-dir"], repo)
+    if not git_dir:
+        return [], {"error": "Not a git repository"}
+
+    tracked_files = _git_ls_files(repo)
+    file_sizes = _git_file_sizes(repo)
+    branches = _git_branches(repo)
+    commits = _git_recent_commits(repo)
+
+    def _add(rule: str, **kwargs: Any) -> None:
+        if rule in ignore_rules:
+            return
+        rule_def = RULES[rule]
+        sev = rule_def["severity"]
+        if severity_filter:
+            order = {SEVERITY_ERROR: 3, SEVERITY_WARNING: 2, SEVERITY_INFO: 1}
+            if order.get(sev, 0) < order.get(severity_filter, 0):
+                return
+        fix = kwargs.pop("fix", rule_def.get("fix", ""))
+        for k, v in list(kwargs.items()):
+            if isinstance(v, str):
+                fix = fix.replace(f"{{{k}}}", v)
+        findings.append(Finding(rule=rule, severity=sev, message=rule_def["message"],
+                                fix=fix, **kwargs))
+
+    # GIT006: Missing .gitignore
+    gitignore_path = os.path.join(repo, ".gitignore")
+    has_gitignore = os.path.isfile(gitignore_path)
+    if not has_gitignore:
+        _add("GIT006")
+
+    # GIT012: Missing .gitattributes
+    gitattributes_path = os.path.join(repo, ".gitattributes")
+    if not os.path.isfile(gitattributes_path):
+        _add("GIT012")
+
+    # GIT011: Submodule HTTP
+    gitmodules_path = os.path.join(repo, ".gitmodules")
+    if os.path.isfile(gitmodules_path):
+        content = _file_content(gitmodules_path)
+        if content:
+            for line in content.splitlines():
+                if "url" in line.lower() and "http://" in line:
+                    _add("GIT011", file=".gitmodules",
+                         context=line.strip())
+
+    # Read .gitignore content for gap analysis
+    gitignore_content = ""
+    if has_gitignore:
+        try:
+            with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
+                gitignore_content = f.read()
+        except (OSError, IOError):
+            pass
+
+    # GIT007: .gitignore gaps — check for Python project patterns
+    if has_gitignore:
+        # Detect project type
+        has_python = any(f.endswith(".py") for f in tracked_files)
+        has_node = any(f == "package.json" for f in tracked_files)
+
+        check_patterns: list[str] = list(GITIGNORE_PATTERNS.get("General", []))
+        if has_python:
+            check_patterns.extend(GITIGNORE_PATTERNS.get("Python", []))
+        if has_node:
+            check_patterns.extend(GITIGNORE_PATTERNS.get("Node.js", []))
+
+        for pattern in check_patterns:
+            # Simple check: is the pattern (or close variant) in .gitignore?
+            base = pattern.rstrip("/").replace("*.", "").replace(".", r"\.")
+            if not re.search(re.escape(pattern.rstrip("/")), gitignore_content, re.IGNORECASE):
+                # Only flag if such files actually exist in tracked files
+                if any(pattern.rstrip("/").replace("*", "") in f for f in tracked_files):
+                    _add("GIT007", context=f"Pattern: {pattern}",
+                         pattern=pattern)
+
+    files_scanned = 0
+    secrets_found = 0
+    binary_count = 0
+    large_count = 0
+
+    for filepath in tracked_files:
+        full_path = os.path.join(repo, filepath)
+
+        # GIT001: Sensitive files
+        for pat, desc in SENSITIVE_FILE_RES:
+            if pat.search(filepath):
+                _add("GIT001", file=filepath, context=desc, path=filepath)
+                break
+
+        # GIT013: Generated/build files
+        for pat, desc in GENERATED_RES:
+            if pat.search(filepath):
+                _add("GIT013", file=filepath, context=desc, path=filepath)
+                break
+
+        # GIT003: Large files
+        size = file_sizes.get(filepath, 0)
+        if size > large_file_threshold:
+            size_mb = size / 1_000_000
+            _add("GIT003", file=filepath,
+                 context=f"Size: {size_mb:.1f} MB",
+                 pattern=f"*{Path(filepath).suffix}" if Path(filepath).suffix else filepath)
+            large_count += 1
+
+        # GIT004: Binary files
+        ext = Path(filepath).suffix.lower()
+        if ext in BINARY_EXTENSIONS:
+            binary_count += 1
+            # Only flag if there are many or they're large
+            if size > 100_000:
+                _add("GIT004", file=filepath,
+                     context=f"Binary file ({ext}, {size / 1000:.0f} KB)")
+
+        # GIT014: Symlinks
+        if os.path.islink(full_path):
+            _add("GIT014", file=filepath)
+
+        # GIT015: Deep nesting
+        depth = len(Path(filepath).parts)
+        if depth > 8:
+            _add("GIT015", file=filepath,
+                 context=f"Nesting depth: {depth} levels")
+
+        # Content-based checks (skip binary, skip very large)
+        if ext not in BINARY_EXTENSIONS and size < 500_000:
+            content = _file_content(full_path)
+            if content is not None:
+                files_scanned += 1
+
+                # GIT002: Secrets in files
+                for pat, desc in SECRET_RES:
+                    match = pat.search(content)
+                    if match:
+                        # Find line number
+                        line_num = content[:match.start()].count("\n") + 1
+                        _add("GIT002", file=filepath, line=line_num,
+                             context=desc)
+                        secrets_found += 1
+                        break  # One secret per file is enough
+
+                # GIT005: Merge conflict markers
+                if CONFLICT_MARKER_RE.search(content):
+                    for i, line in enumerate(content.splitlines(), 1):
+                        if re.match(r"^<{7}\s", line):
+                            _add("GIT005", file=filepath, line=i)
+                            break
+
+                # GIT009: Mixed line endings
+                has_crlf = "\r\n" in content
+                has_lf = "\n" in content.replace("\r\n", "")
+                if has_crlf and has_lf:
+                    _add("GIT009", file=filepath)
+
+    # GIT010: Trivial commit messages
+    trivial_count = 0
+    for commit_hash, message in commits:
+        if TRIVIAL_MESSAGES.match(message.strip()):
+            trivial_count += 1
+            if trivial_count <= 3:  # Cap to avoid noise
+                _add("GIT010", context=f"Commit {commit_hash[:8]}: \"{message}\"")
+
+    # GIT008: Stale branches
     import time
     now = time.time()
-    stale_threshold = now - (stale_days * 86400)
-
-    for line in out.split("\n"):
-        parts = line.split(None, 2)
-        if len(parts) < 3:
+    for branch, date_str in branches:
+        if branch in ("main", "master"):
             continue
-        branch = parts[0]
         try:
-            commit_time = int(parts[1])
-        except ValueError:
-            continue
-        relative = parts[2]
-
-        if commit_time < stale_threshold and branch not in ("main", "master", "develop", "dev"):
-            findings.append({
-                "rule": "GA006",
-                "severity": "INFO",
-                "message": f"Stale branch: {branch} (last commit {relative})",
-                "file": branch,
-                "detail": f"Consider deleting branches with no recent activity",
-            })
-
-    return findings
-
-
-def check_conflict_markers(repo_path):
-    """Check for merge conflict markers left in tracked files."""
-    findings = []
-    out, _ = git("ls-files", cwd=repo_path)
-    if not out:
-        return findings
-
-    text_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
-                 ".c", ".cpp", ".h", ".rb", ".php", ".sh", ".yml", ".yaml",
-                 ".json", ".toml", ".md", ".txt", ".cfg", ".ini", ".html",
-                 ".css", ".scss", ".sql", ".xml", ".env", ".conf"}
-
-    for fpath in out.split("\n"):
-        if not fpath.strip():
-            continue
-        _, ext = os.path.splitext(fpath.lower())
-        if ext not in text_exts:
-            continue
-
-        full_path = os.path.join(repo_path, fpath)
-        if not os.path.isfile(full_path):
-            continue
-
-        try:
-            with open(full_path, "r", errors="ignore") as f:
-                for line_num, line in enumerate(f, 1):
-                    if line.startswith("<<<<<<< ") or line.startswith(">>>>>>> ") or line.startswith("======= "):
-                        # Avoid false positive on markdown horizontal rules
-                        if line.strip() == "=======" or line.startswith("<<<<<<< ") or line.startswith(">>>>>>> "):
-                            findings.append({
-                                "rule": "GA007",
-                                "severity": "ERROR",
-                                "message": f"Merge conflict marker in {fpath}:{line_num}",
-                                "file": fpath,
-                                "line": line_num,
-                                "detail": line.strip()[:80],
-                            })
-                            break  # One finding per file is enough
-        except (OSError, UnicodeDecodeError):
+            # Parse ISO date roughly
+            date_part = date_str[:10]
+            parts = date_part.split("-")
+            if len(parts) == 3:
+                from datetime import datetime
+                dt = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                age_days = (now - dt.timestamp()) / 86400
+                if age_days > 90:
+                    _add("GIT008", context=f"Branch '{branch}' — last commit {int(age_days)} days ago",
+                         branch=branch)
+        except (ValueError, OSError):
             pass
 
-    return findings
+    stats = {
+        "tracked_files": len(tracked_files),
+        "files_scanned": files_scanned,
+        "branches": len(branches),
+        "recent_commits": len(commits),
+        "binary_files": binary_count,
+        "large_files": large_count,
+        "secrets_found": secrets_found,
+    }
+
+    return findings, stats
 
 
-def check_todos(repo_path):
-    """Track TODO/FIXME/HACK/XXX comments."""
-    findings = []
-    out, _ = git("ls-files", cwd=repo_path)
-    if not out:
-        return findings
+# ── Scoring ──────────────────────────────────────────────────────────────────
 
-    text_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
-                 ".c", ".cpp", ".h", ".rb", ".php", ".sh", ".yml", ".yaml",
-                 ".md", ".txt", ".sql", ".html", ".css"}
-
-    pattern = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG)\b\s*:?\s*(.*)", re.IGNORECASE)
-    count = 0
-    MAX_FINDINGS = 50
-
-    for fpath in out.split("\n"):
-        if not fpath.strip() or count >= MAX_FINDINGS:
-            break
-        _, ext = os.path.splitext(fpath.lower())
-        if ext not in text_exts:
-            continue
-
-        full_path = os.path.join(repo_path, fpath)
-        if not os.path.isfile(full_path):
-            continue
-
-        try:
-            with open(full_path, "r", errors="ignore") as f:
-                for line_num, line in enumerate(f, 1):
-                    match = pattern.search(line)
-                    if match:
-                        tag = match.group(1).upper()
-                        msg = match.group(2).strip()[:80]
-                        findings.append({
-                            "rule": "GA008",
-                            "severity": "INFO",
-                            "message": f"{tag} in {fpath}:{line_num}: {msg}",
-                            "file": fpath,
-                            "line": line_num,
-                            "detail": f"{tag}: {msg}",
-                        })
-                        count += 1
-                        if count >= MAX_FINDINGS:
-                            break
-        except (OSError, UnicodeDecodeError):
-            pass
-
-    return findings
+SEVERITY_WEIGHTS = {SEVERITY_ERROR: 15, SEVERITY_WARNING: 7, SEVERITY_INFO: 2}
 
 
-def check_repo_basics(repo_path):
-    """Check basic repo health: README, LICENSE, etc."""
-    findings = []
-
-    # Check for README
-    readme_found = False
-    for name in ["README.md", "README.rst", "README.txt", "README"]:
-        if os.path.exists(os.path.join(repo_path, name)):
-            readme_found = True
-            break
-    if not readme_found:
-        findings.append({
-            "rule": "GA009",
-            "severity": "WARNING",
-            "message": "No README file found",
-            "file": "",
-            "detail": "Add a README.md with project description, installation, and usage",
-        })
-
-    # Check for LICENSE
-    license_found = False
-    for name in ["LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING"]:
-        if os.path.exists(os.path.join(repo_path, name)):
-            license_found = True
-            break
-    if not license_found:
-        findings.append({
-            "rule": "GA010",
-            "severity": "WARNING",
-            "message": "No LICENSE file found",
-            "file": "",
-            "detail": "Add a LICENSE file to clarify usage terms",
-        })
-
-    # Check for uncommitted changes
-    status, code = git("status", "--porcelain", cwd=repo_path)
-    if status:
-        lines = [l for l in status.split("\n") if l.strip()]
-        findings.append({
-            "rule": "GA011",
-            "severity": "INFO",
-            "message": f"Uncommitted changes: {len(lines)} file(s)",
-            "file": "",
-            "detail": "Consider committing or stashing changes",
-        })
-
-    return findings
-
-
-# ── Grading ────────────────────────────────────────────────────────────────
-
-def grade_findings(findings):
-    """Compute a health score from findings."""
-    score = 100
-    for f in findings:
-        sev = f["severity"]
-        if sev == "CRITICAL":
-            score -= 15
-        elif sev == "ERROR":
-            score -= 10
-        elif sev == "WARNING":
-            score -= 3
-        # INFO doesn't reduce score
-
-    score = max(0, min(100, score))
-
-    if score >= 90:
-        grade = "A"
-    elif score >= 80:
-        grade = "B"
-    elif score >= 70:
-        grade = "C"
-    elif score >= 60:
-        grade = "D"
-    else:
-        grade = "F"
-
-    return grade, score
-
-
-# ── Formatting helpers ────────────────────────────────────────────────────
-
-def _fmt_size(nbytes):
-    if nbytes >= 1024 * 1024:
-        return f"{nbytes / (1024*1024):.1f} MB"
-    elif nbytes >= 1024:
-        return f"{nbytes / 1024:.1f} KB"
-    return f"{nbytes} B"
-
-
-SEVERITY_ICON = {
-    "CRITICAL": f"{C.RED}🚨",
-    "ERROR": f"{C.RED}✗",
-    "WARNING": f"{C.YELLOW}⚠",
-    "INFO": f"{C.BLUE}ℹ",
-}
-
-SEVERITY_ORDER = {"CRITICAL": 0, "ERROR": 1, "WARNING": 2, "INFO": 3}
-
-
-# ── Output Formatters ─────────────────────────────────────────────────────
-
-def format_text(repo_path, findings, grade, score, verbose=False):
-    lines = []
-    lines.append(f"\n{C.BOLD}gitaudit v{__version__}{C.RESET} — Git Repository Health Checker\n")
-    lines.append(f"  Repo: {C.BOLD}{repo_path}{C.RESET}")
-
-    grade_color = C.GREEN if grade in ("A", "B") else (C.YELLOW if grade == "C" else C.RED)
-    lines.append(f"  Health: {grade_color}{C.BOLD}{grade}{C.RESET} ({score}/100)\n")
-
+def compute_score(findings: list[Finding]) -> int:
     if not findings:
-        lines.append(f"  {C.GREEN}✓ No issues found — clean repo!{C.RESET}\n")
-        return "\n".join(lines)
+        return 100
+    total = sum(SEVERITY_WEIGHTS.get(f.severity, 1) for f in findings)
+    return max(0, 100 - total)
 
-    # Group by rule
-    by_severity = {"CRITICAL": [], "ERROR": [], "WARNING": [], "INFO": []}
+
+def grade_from_score(score: int) -> str:
+    if score >= 98:
+        return "A+"
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
+# ── Output ───────────────────────────────────────────────────────────────────
+
+SEVERITY_COLORS = {SEVERITY_ERROR: "\033[91m", SEVERITY_WARNING: "\033[93m", SEVERITY_INFO: "\033[96m"}
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GRADE_COLORS = {"A+": "\033[92m", "A": "\033[92m", "B": "\033[93m", "C": "\033[93m", "D": "\033[91m", "F": "\033[91m"}
+
+
+def format_output(findings: list[Finding], stats: dict[str, Any],
+                  use_color: bool = True, verbose: bool = False) -> str:
+    lines: list[str] = []
+
+    if use_color:
+        lines.append(f"{BOLD}gitaudit v{__version__}{RESET} — Git Repository Health & Security Auditor\n")
+        lines.append(f"  {DIM}Tracked files: {stats.get('tracked_files', 0)}{RESET}")
+        lines.append(f"  {DIM}Files scanned: {stats.get('files_scanned', 0)}{RESET}")
+        lines.append(f"  {DIM}Branches: {stats.get('branches', 0)}{RESET}")
+        if stats.get("binary_files"):
+            lines.append(f"  {DIM}Binary files: {stats['binary_files']}{RESET}")
+    else:
+        lines.append(f"gitaudit v{__version__} — Git Repository Health & Security Auditor\n")
+        lines.append(f"  Tracked files: {stats.get('tracked_files', 0)}")
+        lines.append(f"  Files scanned: {stats.get('files_scanned', 0)}")
+        lines.append(f"  Branches: {stats.get('branches', 0)}")
+        if stats.get("binary_files"):
+            lines.append(f"  Binary files: {stats['binary_files']}")
+
+    lines.append("")
+
     for f in findings:
-        by_severity.get(f["severity"], by_severity["INFO"]).append(f)
+        loc = f"{f.file}:{f.line}" if f.file and f.line else (f.file if f.file else "")
+        if use_color:
+            color = SEVERITY_COLORS.get(f.severity, "")
+            lines.append(f"  {color}{f.severity.upper():>7}{RESET}  {BOLD}{f.rule}{RESET}  {loc}")
+            lines.append(f"           {f.message}")
+            if f.context:
+                lines.append(f"           {DIM}{f.context}{RESET}")
+        else:
+            lines.append(f"  {f.severity.upper():>7}  {f.rule}  {loc}")
+            lines.append(f"           {f.message}")
+            if f.context:
+                lines.append(f"           {f.context}")
 
-    for sev in ["CRITICAL", "ERROR", "WARNING", "INFO"]:
-        group = by_severity[sev]
-        if not group:
-            continue
-        if sev == "INFO" and not verbose:
-            lines.append(f"\n  {C.DIM}{len(group)} info item(s) (use --verbose to show){C.RESET}")
-            continue
+    score = compute_score(findings)
+    grade = grade_from_score(score)
+    err = sum(1 for f in findings if f.severity == SEVERITY_ERROR)
+    warn = sum(1 for f in findings if f.severity == SEVERITY_WARNING)
+    info = sum(1 for f in findings if f.severity == SEVERITY_INFO)
 
-        icon = SEVERITY_ICON.get(sev, "")
-        for f in group:
-            lines.append(f"  {icon}{C.RESET} [{f['rule']}] {f['message']}")
-            if verbose and f.get("detail"):
-                lines.append(f"    {C.DIM}→ {f['detail']}{C.RESET}")
+    if use_color:
+        gc = GRADE_COLORS.get(grade, "")
+        lines.append(f"\n{BOLD}{'─' * 60}{RESET}")
+        lines.append(f"  {BOLD}Grade: {gc}{grade}{RESET}  {BOLD}Score: {gc}{score}/100{RESET}")
+        parts = []
+        if err:
+            parts.append(f"\033[91m{err} errors{RESET}")
+        if warn:
+            parts.append(f"\033[93m{warn} warnings{RESET}")
+        if info:
+            parts.append(f"\033[96m{info} info{RESET}")
+        if parts:
+            lines.append(f"  {', '.join(parts)}")
+        else:
+            lines.append(f"  \033[92mRepository is clean ✓{RESET}")
+        lines.append(f"{BOLD}{'─' * 60}{RESET}")
+    else:
+        lines.append(f"\n{'─' * 60}")
+        lines.append(f"  Grade: {grade}  Score: {score}/100")
+        parts = []
+        if err:
+            parts.append(f"{err} errors")
+        if warn:
+            parts.append(f"{warn} warnings")
+        if info:
+            parts.append(f"{info} info")
+        lines.append(f"  {', '.join(parts)}" if parts else "  Repository is clean ✓")
+        lines.append(f"{'─' * 60}")
 
-    # Summary
-    counts = {s: len(by_severity[s]) for s in by_severity}
-    lines.append(f"\n{C.BOLD}Summary:{C.RESET} "
-                 f"{counts['CRITICAL']} critical, {counts['ERROR']} errors, "
-                 f"{counts['WARNING']} warnings, {counts['INFO']} info\n")
+    if verbose and findings:
+        lines.append("")
+        lines.append(f"  {BOLD}Fix suggestions:{RESET}" if use_color else "  Fix suggestions:")
+        seen: set[str] = set()
+        for f in findings:
+            if f.rule not in seen and f.fix:
+                seen.add(f.rule)
+                lines.append(f"  • {f.fix}")
 
     return "\n".join(lines)
 
 
-def format_json(repo_path, findings, grade, score):
-    output = {
-        "version": __version__,
-        "repo": repo_path,
-        "grade": grade,
-        "score": score,
+def format_json(findings: list[Finding], stats: dict[str, Any]) -> str:
+    score = compute_score(findings)
+    grade = grade_from_score(score)
+    return json.dumps({
+        "grade": grade, "score": score, "stats": stats,
         "total_findings": len(findings),
-        "counts": {
-            "critical": len([f for f in findings if f["severity"] == "CRITICAL"]),
-            "error": len([f for f in findings if f["severity"] == "ERROR"]),
-            "warning": len([f for f in findings if f["severity"] == "WARNING"]),
-            "info": len([f for f in findings if f["severity"] == "INFO"]),
-        },
-        "findings": findings,
-    }
-    return json.dumps(output, indent=2)
+        "errors": sum(1 for f in findings if f.severity == SEVERITY_ERROR),
+        "warnings": sum(1 for f in findings if f.severity == SEVERITY_WARNING),
+        "info": sum(1 for f in findings if f.severity == SEVERITY_INFO),
+        "findings": [f.to_dict() for f in findings],
+    }, indent=2)
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────
-
-ALL_CHECKS = {
-    "size": ("Large files in working tree", check_large_files),
-    "history": ("Large blobs in git history", check_large_blobs_history),
-    "secrets": ("Potential secrets in code", check_secrets),
-    "gitignore": ("Missing .gitignore patterns", check_gitignore),
-    "branches": ("Stale branches", check_branches),
-    "conflicts": ("Merge conflict markers", check_conflict_markers),
-    "todos": ("TODO/FIXME tracking", check_todos),
-    "basics": ("Repo basics (README, LICENSE)", check_repo_basics),
-}
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        prog="gitaudit",
-        description="Git Repository Health Checker — audit repos for large files, secrets, stale branches, and more.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
-            examples:
-              gitaudit                         Audit current repo (all checks)
-              gitaudit /path/to/repo           Audit specific repo
-              gitaudit --check secrets         Only check for secrets
-              gitaudit --check size,secrets    Run specific checks
-              gitaudit --json                  JSON output
-              gitaudit --verbose               Show all findings including INFO
-              gitaudit --ci                    CI mode: exit 1 on errors/criticals
+def print_help() -> None:
+    print(f"""gitaudit v{__version__} — Git Repository Health & Security Auditor
 
-            checks:
-              size       Large files in working tree (>500KB)
-              history    Large blobs in git history (>1MB)
-              secrets    Potential secrets (API keys, tokens, passwords)
-              gitignore  Missing .gitignore patterns
-              branches   Stale branches (>90 days)
-              conflicts  Merge conflict markers left in code
-              todos      TODO/FIXME/HACK tracking
-              basics     README, LICENSE, uncommitted changes
-        """),
+Usage:
+    gitaudit [options] [path]
+
+Options:
+    -h, --help              Show this help
+    -v, --version           Show version
+    --check                 Exit 1 if score below threshold (CI mode)
+    --min-score N           Minimum score for --check (default: 80)
+    --json                  Output as JSON
+    --severity LEVEL        Minimum severity: error, warning, info
+    --ignore RULES          Comma-separated rules to ignore
+    --large-threshold N     Large file threshold in bytes (default: 1000000)
+    --verbose               Show fix suggestions
+    --no-color              Disable colored output
+    --list-rules            List all rules
+
+Examples:
+    gitaudit                Audit current repo
+    gitaudit /path/to/repo  Audit specific repo
+    gitaudit --check .      CI mode
+    gitaudit --severity error .  Only show errors
+""")
+
+
+def print_rules() -> None:
+    print(f"gitaudit v{__version__} — Rules\n")
+    for rule_id, rule_def in sorted(RULES.items()):
+        sev = rule_def["severity"].upper()
+        name = rule_def["name"]
+        msg = rule_def["message"]
+        print(f"  {rule_id}  [{sev:>7}]  {name}")
+        print(f"           {msg}")
+        print()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+
+    path = "."
+    check_mode = False
+    min_score = 80
+    json_mode = False
+    severity_filter: str | None = None
+    ignore_rules: set[str] = set()
+    large_threshold = 1_000_000
+    verbose = False
+    no_color = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print_help()
+            return 0
+        elif arg in ("-v", "--version"):
+            print(f"gitaudit {__version__}")
+            return 0
+        elif arg == "--list-rules":
+            print_rules()
+            return 0
+        elif arg == "--check":
+            check_mode = True
+        elif arg == "--min-score":
+            i += 1
+            if i < len(args):
+                try:
+                    min_score = int(args[i])
+                except ValueError:
+                    print("Error: --min-score requires integer", file=sys.stderr)
+                    return 2
+        elif arg == "--json":
+            json_mode = True
+        elif arg == "--severity":
+            i += 1
+            if i < len(args):
+                severity_filter = args[i].lower()
+        elif arg == "--ignore":
+            i += 1
+            if i < len(args):
+                ignore_rules = {r.strip().upper() for r in args[i].split(",")}
+        elif arg == "--large-threshold":
+            i += 1
+            if i < len(args):
+                try:
+                    large_threshold = int(args[i])
+                except ValueError:
+                    print("Error: --large-threshold requires integer", file=sys.stderr)
+                    return 2
+        elif arg == "--verbose":
+            verbose = True
+        elif arg == "--no-color":
+            no_color = True
+        elif not arg.startswith("-"):
+            path = arg
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            return 2
+        i += 1
+
+    use_color = not no_color and not json_mode and sys.stdout.isatty()
+
+    findings, stats = audit_repo(
+        path,
+        ignore_rules=ignore_rules,
+        severity_filter=severity_filter,
+        large_file_threshold=large_threshold,
     )
 
-    parser.add_argument("repo", nargs="?", default=".", help="Repository path (default: current directory)")
-    parser.add_argument("--check", "-c", metavar="CHECKS",
-                        help="Run specific checks (comma-separated: size,secrets,branches,...)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Show all findings including INFO")
-    parser.add_argument("--json", dest="json_output", action="store_true", help="JSON output")
-    parser.add_argument("--ci", action="store_true", help="CI mode: exit 1 if any CRITICAL or ERROR findings")
-    parser.add_argument("--list-checks", action="store_true", help="List all available checks")
-    parser.add_argument("--version", action="version", version=f"gitaudit {__version__}")
+    if "error" in stats:
+        if json_mode:
+            print(json.dumps({"error": stats["error"]}))
+        else:
+            print(f"Error: {stats['error']}", file=sys.stderr)
+        return 2
 
-    args = parser.parse_args()
+    findings.sort(key=lambda f: (f.severity != SEVERITY_ERROR,
+                                  f.severity != SEVERITY_WARNING,
+                                  f.file, f.line))
 
-    if args.list_checks:
-        print(f"\n{C.BOLD}Available checks:{C.RESET}\n")
-        for name, (desc, _) in ALL_CHECKS.items():
-            print(f"  {C.CYAN}{name:12s}{C.RESET} {desc}")
-        print()
-        sys.exit(0)
-
-    repo_path = os.path.abspath(args.repo)
-
-    if not is_git_repo(repo_path):
-        print(f"Error: {repo_path} is not a git repository.", file=sys.stderr)
-        sys.exit(1)
-
-    # Determine which checks to run
-    if args.check:
-        check_names = [c.strip() for c in args.check.split(",")]
-        for cn in check_names:
-            if cn not in ALL_CHECKS:
-                print(f"Error: Unknown check '{cn}'. Use --list-checks to see available checks.", file=sys.stderr)
-                sys.exit(1)
+    if json_mode:
+        print(format_json(findings, stats))
     else:
-        check_names = list(ALL_CHECKS.keys())
+        print(format_output(findings, stats, use_color=use_color, verbose=verbose))
 
-    # Run checks
-    all_findings = []
-    if not args.json_output:
-        print(f"\n{C.BOLD}gitaudit v{__version__}{C.RESET} — Scanning...\n")
+    if check_mode:
+        score = compute_score(findings)
+        if score < min_score:
+            return 1
 
-    for check_name in check_names:
-        desc, check_fn = ALL_CHECKS[check_name]
-        if not args.json_output:
-            print(f"  {C.DIM}⏳ {desc}...{C.RESET}", flush=True)
-        findings = check_fn(repo_path)
-        all_findings.extend(findings)
-
-    # Sort by severity
-    all_findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
-
-    # Grade
-    grade, score = grade_findings(all_findings)
-
-    # Output
-    if args.json_output:
-        print(format_json(repo_path, all_findings, grade, score))
-    else:
-        print(format_text(repo_path, all_findings, grade, score, verbose=args.verbose))
-
-    # CI mode
-    if args.ci:
-        has_critical = any(f["severity"] in ("CRITICAL", "ERROR") for f in all_findings)
-        sys.exit(1 if has_critical else 0)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

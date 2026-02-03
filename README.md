@@ -1,153 +1,152 @@
 # gitaudit
 
-**Git Repository Health Checker** — Audit repos for large files, potential secrets, stale branches, missing .gitignore patterns, merge conflict markers, TODO tracking, and more. A linter for your git repo itself.
-
-Zero dependencies. Pure Python stdlib. Single file.
+**Git Repository Health & Security Auditor** — Zero-dependency tool that audits Git repositories for security issues, health problems, and best practice violations. Catches secrets, sensitive files, large files, merge conflicts, stale branches, and more.
 
 ## Why?
 
-Git repos accumulate problems over time:
-- **Large files** bloat clone times and storage
-- **Secrets** (API keys, tokens) get committed accidentally
-- **Stale branches** clutter the repo
-- **Missing .gitignore** leads to committing unwanted files
-- **Merge conflict markers** get left in code
-- **TODOs** pile up and are forgotten
+Existing tools are specialized and fragmented:
+- **gitleaks/truffleHog**: Secrets only (Go/Python with deps)
+- **git-sizer**: Repo size only (Go)
+- **repo-security-scanner**: Basic secrets only (Go)
 
-Existing tools are specialized: git-sizer (size only), trufflehog/gitleaks (secrets only, heavy). No single lightweight tool covers all repo health checks with grading.
+**gitaudit** is a single zero-dependency Python file that covers **15 rules** across security, hygiene, and best practices.
 
-**gitaudit** runs 8 checks in seconds and gives you a health grade.
-
-## Install
+## Installation
 
 ```bash
 curl -O https://raw.githubusercontent.com/kriskimmerle/gitaudit/main/gitaudit.py
 chmod +x gitaudit.py
 ```
 
-No dependencies beyond Python 3.7+ and git.
-
-## Usage
-
-### Full Audit
+## Quick Start
 
 ```bash
-gitaudit                    # Audit current repo
-gitaudit /path/to/repo      # Audit specific repo
+# Audit current repo
+python gitaudit.py
+
+# Audit specific repo
+python gitaudit.py /path/to/repo
+
+# CI mode
+python gitaudit.py --check --min-score 80 .
+
+# JSON output
+python gitaudit.py --json .
+
+# Only errors (secrets + conflicts)
+python gitaudit.py --severity error .
 ```
 
-```
-gitaudit v1.0.0 — Git Repository Health Checker
+## Rules (15)
 
-  Repo: /path/to/myproject
-  Health: B (85/100)
+### Errors (security)
 
-  🚨 [GA003] Potential AWS Access Key in config.py:12
-  ⚠ [GA001] Large file: data/dump.sql (15.2 MB)
-  ⚠ [GA005] Missing .gitignore pattern: .env
+| Rule | Name | Description |
+|------|------|-------------|
+| GIT001 | sensitive-file-tracked | Sensitive file tracked (.env, *.pem, *.key, id_rsa, etc.) |
+| GIT002 | secret-in-file | Secret/credential detected in tracked file (20+ patterns) |
+| GIT005 | merge-conflict-marker | Unresolved merge conflict markers in file |
 
-  3 info item(s) (use --verbose to show)
+### Warnings (hygiene)
 
-Summary: 1 critical, 0 errors, 2 warnings, 3 info
-```
+| Rule | Name | Description |
+|------|------|-------------|
+| GIT003 | large-file | Large file tracked (>1MB, consider Git LFS) |
+| GIT006 | missing-gitignore | No .gitignore file found |
+| GIT011 | submodule-http | Git submodule uses HTTP instead of HTTPS |
 
-### Specific Checks
+### Info (best practices)
 
-```bash
-gitaudit --check secrets           # Only scan for secrets
-gitaudit --check size,history      # Large files + history
-gitaudit --check secrets,conflicts # Secrets + conflict markers
-```
+| Rule | Name | Description |
+|------|------|-------------|
+| GIT004 | binary-file | Large binary file tracked |
+| GIT007 | gitignore-gap | Common pattern missing from .gitignore |
+| GIT008 | stale-branch | Branch with no commits in 90+ days |
+| GIT009 | mixed-line-endings | Mixed CRLF + LF line endings |
+| GIT010 | empty-commit-message | Trivial/empty commit message |
+| GIT012 | no-gitattributes | No .gitattributes (line ending normalization) |
+| GIT013 | tracked-generated-file | Build artifact tracked (node_modules, __pycache__, etc.) |
+| GIT014 | symlink-in-repo | Symlink tracked (cross-platform issue) |
+| GIT015 | deep-nesting | Path deeper than 8 levels (Windows path length issues) |
 
-### Verbose Mode
+## Secret Detection (20+ patterns)
 
-```bash
-gitaudit --verbose    # Show all findings including INFO items
-```
-
-### JSON Output
-
-```bash
-gitaudit --json
-```
-
-### CI Mode
-
-```bash
-gitaudit --ci    # Exit 1 if any CRITICAL or ERROR findings
-```
-
-## Checks
-
-| Check | Rule | What it finds |
-|-------|------|---------------|
-| `size` | GA001 | Files >500KB in working tree |
-| `history` | GA002 | Blobs >1MB in git history |
-| `secrets` | GA003 | API keys, tokens, passwords, private keys |
-| `gitignore` | GA004-05 | Missing .gitignore or patterns |
-| `branches` | GA006 | Branches with no commits in 90+ days |
-| `conflicts` | GA007 | Merge conflict markers (`<<<<<<<`) left in code |
-| `todos` | GA008 | TODO/FIXME/HACK/XXX comments |
-| `basics` | GA009-11 | Missing README, LICENSE, uncommitted changes |
-
-### Secret Patterns Detected
-
-- AWS Access Keys (`AKIA...`)
-- GitHub Tokens (`ghp_...`, `github_pat_...`)
-- Slack Tokens (`xox[bpors]-...`)
-- Stripe Keys (`sk_live_...`, `sk_test_...`)
-- Private Keys (`-----BEGIN PRIVATE KEY-----`)
-- Generic API keys, passwords, database URLs
+gitaudit scans tracked files for:
+- GitHub tokens (PAT, OAuth, fine-grained)
+- AWS access keys
+- OpenAI / Anthropic API keys
+- Slack tokens
+- Stripe keys
+- SendGrid API keys
+- Google API keys and OAuth tokens
 - JWTs
+- Private keys (PEM/PKCS)
+- Hardcoded passwords, API keys, and secrets
 
-## Grading
+## Sensitive File Detection (24 patterns)
 
-| Grade | Score | Meaning |
-|-------|-------|---------|
-| A | 90-100 | Healthy repo |
-| B | 80-89 | Minor issues |
-| C | 70-79 | Notable problems |
-| D | 60-69 | Significant issues |
-| F | 0-59 | Critical problems |
+Flags tracked files matching:
+`.env`, `id_rsa`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `credentials.json`, `secrets.yml`, `.npmrc`, `.pypirc`, `master.key`, and more.
 
-Scoring: CRITICAL -15, ERROR -10, WARNING -3, INFO ±0.
+## Example Output
+
+```
+$ python gitaudit.py --verbose
+
+gitaudit v0.1.0 — Git Repository Health & Security Auditor
+
+  Tracked files: 342
+  Files scanned: 298
+  Branches: 12
+
+    ERROR  GIT001  .env
+           Sensitive file tracked in repository
+           .env file (environment variables/secrets)
+    ERROR  GIT002  config/settings.py:45
+           Potential secret/credential detected in tracked file
+           Hardcoded Password
+  WARNING  GIT003  data/model.h5
+           Large file tracked (consider Git LFS)
+           Size: 15.2 MB
+     INFO  GIT008
+           Stale branch (no commits in 90+ days)
+           Branch 'feature/old-experiment' — last commit 142 days ago
+
+────────────────────────────────────────────────────────────
+  Grade: F  Score: 54/100
+  2 errors, 1 warnings, 3 info
+────────────────────────────────────────────────────────────
+```
 
 ## CI/CD Integration
 
 ```yaml
-# .github/workflows/repo-health.yml
-name: Repo Health
-on: [push, pull_request]
-jobs:
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Audit repo
-        run: |
-          curl -sO https://raw.githubusercontent.com/kriskimmerle/gitaudit/main/gitaudit.py
-          python3 gitaudit.py --ci
+# GitHub Actions
+- name: Audit repository
+  run: python gitaudit.py --check --min-score 90 .
 ```
 
-## CLI Reference
+## Options
 
 ```
-gitaudit [OPTIONS] [REPO]
-
-Arguments:
-  REPO                Repository path (default: current directory)
-
-Options:
-  -c, --check CHECKS  Specific checks (comma-separated)
-  -v, --verbose        Show all findings including INFO
-  --json               JSON output
-  --ci                 Exit 1 on CRITICAL/ERROR findings
-  --list-checks        List available checks
-  --version            Show version
-  -h, --help           Show help
+-h, --help              Show help
+-v, --version           Show version
+--check                 Exit 1 if score below threshold
+--min-score N           Minimum score (default: 80)
+--json                  JSON output
+--severity LEVEL        Filter: error, warning, info
+--ignore RULES          Ignore specific rules
+--large-threshold N     Large file size in bytes (default: 1000000)
+--verbose               Show fix suggestions
+--no-color              Disable colors
+--list-rules            List all rules
 ```
+
+## Requirements
+
+- Python 3.9+
+- Git (for `git ls-files`, `git ls-tree`, `git log`, etc.)
+- Zero Python dependencies
 
 ## License
 

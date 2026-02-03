@@ -4,14 +4,15 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "gitaudit"
-version = "1.0.0"
-description = "Git Repository Health Checker — audit repos for large files, secrets, stale branches, and more"
+version = "0.1.0"
+description = "Git Repository Health & Security Auditor — zero-dependency, 15 rules for secrets, large files, and best practices"
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.7"
+license = "MIT"
+requires-python = ">=3.9"
 authors = [
-    {name = "Kris Kimmerle", email = "kris@kriskimmerle.com"},
+    { name = "Kris Kimmerle" },
 ]
+keywords = ["git", "security", "audit", "secrets", "repository", "health"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -19,16 +20,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Security",
     "Topic :: Software Development :: Version Control :: Git",
-    "Topic :: Utilities",
 ]
-keywords = ["git", "audit", "security", "secrets", "health", "linter", "cli"]
-
-[project.urls]
-Homepage = "https://github.com/kriskimmerle/gitaudit"
-Repository = "https://github.com/kriskimmerle/gitaudit"
-Issues = "https://github.com/kriskimmerle/gitaudit/issues"
+urls = { Homepage = "https://github.com/kriskimmerle/gitaudit" }
 
 [project.scripts]
 gitaudit = "gitaudit:main"
